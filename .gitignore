@@ -1,0 +1,5 @@
+tmp/
+torrents/
+dht_db
+dht_crawler.db
+*.txt

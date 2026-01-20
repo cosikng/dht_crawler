@@ -125,6 +125,8 @@ private:
 std::mutex g_seen_hashes_mutex;
 std::set<lt::sha1_hash> g_seen_hashes;
 
+char bind_address[500];
+
 // 并发控制
 std::atomic<int> g_active_tasks{0};
 const int MAX_CONCURRENT_TASKS = 200; // 限制最大并发线程数
@@ -134,7 +136,7 @@ struct TaskCounter {
     ~TaskCounter() { g_active_tasks--; }
 };
 
-void fetch_metadata(lt::session &ses, lt::sha1_hash const &info_hash, lt::tcp::endpoint const &peer, std::shared_ptr<DatabaseManager> db_manager)
+void fetch_metadata(lt::session &ses, lt::sha1_hash const &info_hash, lt::tcp::endpoint const &peer, DatabaseManager* db_manager)
 {
     // 如果并发任务过多，直接放弃，避免 CPU 过载
     if (g_active_tasks >= MAX_CONCURRENT_TASKS)
@@ -227,6 +229,8 @@ void fetch_metadata(lt::session &ses, lt::sha1_hash const &info_hash, lt::tcp::e
     ses.remove_torrent(h, lt::session::delete_files);
 }
 
+DatabaseManager* db_manager_global = nullptr;
+
 void DHTListener(int id)
 {
     unsigned long long requests = 0, responses = 0;
@@ -239,7 +243,7 @@ void DHTListener(int id)
     settings.set_str(lt::settings_pack::dht_bootstrap_nodes,
                      "dht.libtorrent.org:25401,router.utorrent.com:6881,dht.transmissionbt.com:6881,router.bittorrent.com:6881");
     char addr[50];
-    sprintf(addr, "[::]:%d", 6881 + id);
+    sprintf(addr, "%s:%d", bind_address, 6881 + id);
     settings.set_str(lt::settings_pack::listen_interfaces, addr);
 
     lt::session ses(settings);
@@ -251,8 +255,6 @@ void DHTListener(int id)
     auto last_stats_time = std::chrono::steady_clock::now();
     const auto stats_interval = std::chrono::seconds(60); // 每10秒显示一次状态
 
-    // *** NEW: 创建数据库管理器实例 ***
-    auto db_manager = std::make_shared<DatabaseManager>("dht_crawler.db");
     std::cout << "DHT 爬虫已启动，数据库已连接..." << std::endl;
 
     while (true)
@@ -323,7 +325,7 @@ void DHTListener(int id)
                                 // *** FIX for 2.0.x ***: 使用 get_endpoint() 成员函数
                                 lt::tcp::endpoint peer(p->node.address(), static_cast<std::uint16_t>(port_val));
 
-                                std::thread(fetch_metadata, std::ref(ses), info_hash, peer, db_manager).detach();
+                                std::thread(fetch_metadata, std::ref(ses), info_hash, peer, db_manager_global).detach();
                             }
                         }
                         else if (dict.dict_find_string_value("q") == "get_peers")
@@ -375,16 +377,25 @@ int main(int argc, char *argv[])
 {
     // 初始化时加载已有 hash
     {
-        DatabaseManager db("dht_crawler.db");
-        db.load_hashes(g_seen_hashes);
+        db_manager_global = new DatabaseManager("dht_crawler.db");
+        db_manager_global->load_hashes(g_seen_hashes);
         std::cout << "已从数据库加载 " << g_seen_hashes.size() << " 个历史 Hash。" << std::endl;
     }
 
     int num = 1;
-    if (argc != 1)
+    if (argc == 3)
     {
-        num = atoi(argv[1]);
+        num = atoi(argv[2]);
+        std::strcpy(bind_address, argv[1]);
     }
+    else if(argc == 2)
+    {
+        std::strcpy(bind_address, argv[1]);
+    }
+    else{
+        std::strcpy(bind_address, "0.0.0.0");
+    }
+    std::cout << "绑定地址: " << bind_address << std::endl;
     while (num--)
     {
         std::thread(DHTListener, num).detach();
