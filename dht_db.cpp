@@ -154,7 +154,17 @@ void fetch_metadata(lt::session &ses, lt::sha1_hash const &info_hash, lt::tcp::e
     params.flags |= lt::torrent_flags::upload_mode;
     // params.flags |= lt::torrent_flags::stop_when_ready;
 
-    lt::torrent_handle h = ses.add_torrent(params);
+    lt::torrent_handle h;
+    try
+    {
+        h = ses.add_torrent(params);
+    }
+    catch (std::exception const& e)
+    {
+        std::cerr << "[Fetcher] 异常: 添加种子失败 " << hex_hash << " : " << e.what() << std::endl;
+        return;
+    }
+
     if (!h.is_valid())
     {
         std::cerr << "[Fetcher] 错误: 添加种子失败 " << hex_hash << std::endl;
@@ -307,6 +317,10 @@ void DHTListener(int id)
 
                             // *** FIX for 2.0.x ***: 使用 string_view() 构造哈希，避免弃用警告
                             lt::sha1_hash info_hash(hash_entry.string_value());
+
+                            // 过滤全0的无效哈希
+                            if (info_hash.is_all_zeros())
+                                continue;
 
                             std::unique_lock<std::mutex> lock(g_seen_hashes_mutex);
                             if (g_seen_hashes.find(info_hash) == g_seen_hashes.end())
