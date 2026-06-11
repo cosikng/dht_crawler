@@ -1,25 +1,55 @@
-## 一个简单的dht爬虫
+## 一个简单的 DHT 爬虫
 
 ### 依赖库
+
+```text
+libtorrent-rasterbar >= 2.0
+SQLite3
 ```
-libtorrent-rasterbar
-libsqlite3
-```
+
 ### 编译
+
 ```shell
-cmake -S . -B build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
 ### 执行
-`./build/dht_db bind_addr threads`
 
-`bind_addr`指定要绑定的接口，`IPv4`和`IPv6`均可
+兼容原有位置参数：
 
-`threads`指定要启动的线程数，取值范围为`1-64`，即DHT实例数；绑定的端口从`6881`开始，注意设置防火墙开放对应端口
+```shell
+./build/dht_db bind_addr listeners
+```
+
+也可以使用完整选项：
+
+```shell
+./build/dht_db \
+  --bind 0.0.0.0 \
+  --listeners 1 \
+  --first-port 6881 \
+  --max-active 200 \
+  --metadata-timeout 30 \
+  --retry-delay 60
+```
+
+使用 `./build/dht_db --help` 查看数据库路径、临时目录、torrent
+目录和 bootstrap 节点等选项。
+
+`bind_addr` 支持 IPv4 和 IPv6。`listeners` 取值范围为 `1-64`，
+表示同一个 libtorrent session 监听的连续端口数量，端口从
+`first-port` 开始。请确保防火墙允许对应端口。
+
+按 `Ctrl-C` 或发送 `SIGTERM` 可以有序退出。
+
 ### 结果查看
-运行一段时间后同目录下会出现`tmp`、`torrents`两个目录和`dht_crawler.db`一个文件，`dht_crawler.db`是`sqlite`数据库文件，可以用`sqlite`终端或者`python`的`sqlite`库打开，记录了爬取到的种子哈希、资源名、提供该种子的peer和时间。`torrents`目录下则以哈希值为文件名存储所有种子
 
-`TIPS`:如果尝试下载种子时找不到任何peer，可以添加数据库中记录的peer试一下
+默认会生成 `tmp`、`torrents` 目录和 `dht_crawler.db` 数据库。
+数据库记录种子 Hash、资源名、提供元数据的 peer 和发现时间；
+`torrents` 目录按 Hash 保存 `.torrent` 文件。
 
 ### 免责声明
-本程序直接使用`libtorrent`库做DHT网络构建和维护，完全符合DHT协议规范，可以正常向外提供DHT节点服务，因此开启较多线程数时可能占用大量cpu和网络带宽，请自行对自己的流量和账单负责
+
+本程序使用 libtorrent 构建和维护 DHT 节点。增加监听端口或并发任务数
+可能显著提高 CPU、磁盘和网络开销，请自行评估流量和运行成本。
