@@ -8,6 +8,8 @@
 #include <mutex>
 #include <memory>
 #include <atomic>
+#include <charconv>
+#include <system_error>
 
 #include <libtorrent/session.hpp>
 #include <libtorrent/session_params.hpp>
@@ -125,19 +127,59 @@ private:
 std::mutex g_seen_hashes_mutex;
 std::set<lt::sha1_hash> g_seen_hashes;
 
-char bind_address[500];
+std::string bind_address = "0.0.0.0";
 
 // 并发控制
 std::atomic<int> g_active_tasks{0};
 const int MAX_CONCURRENT_TASKS = 200; // 限制最大并发线程数
+constexpr int MIN_LISTENER_THREADS = 1;
+constexpr int MAX_LISTENER_THREADS = 64;
+constexpr int FIRST_LISTEN_PORT = 6881;
 
 struct TaskCounter {
     TaskCounter() { g_active_tasks++; }
     ~TaskCounter() { g_active_tasks--; }
 };
 
-void fetch_metadata(lt::session &ses, lt::sha1_hash const &info_hash, lt::tcp::endpoint const &peer, DatabaseManager* db_manager)
+class TorrentCleanup
 {
+public:
+    TorrentCleanup(lt::session &session, lt::torrent_handle handle)
+        : session_(session), handle_(std::move(handle))
+    {
+    }
+
+    ~TorrentCleanup()
+    {
+        if (!handle_.is_valid())
+            return;
+
+        try
+        {
+            session_.remove_torrent(handle_, lt::session::delete_files);
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[Fetcher] 清理 torrent 失败: " << e.what() << std::endl;
+        }
+        catch (...)
+        {
+            std::cerr << "[Fetcher] 清理 torrent 时发生未知异常" << std::endl;
+        }
+    }
+
+    TorrentCleanup(const TorrentCleanup &) = delete;
+    TorrentCleanup &operator=(const TorrentCleanup &) = delete;
+
+private:
+    lt::session &session_;
+    lt::torrent_handle handle_;
+};
+
+void fetch_metadata_impl(const std::shared_ptr<lt::session> &session, lt::sha1_hash const &info_hash, lt::tcp::endpoint const &peer, DatabaseManager* db_manager)
+{
+    lt::session &ses = *session;
+
     // 如果并发任务过多，直接放弃，避免 CPU 过载
     if (g_active_tasks >= MAX_CONCURRENT_TASKS)
         return;
@@ -155,15 +197,7 @@ void fetch_metadata(lt::session &ses, lt::sha1_hash const &info_hash, lt::tcp::e
     // params.flags |= lt::torrent_flags::stop_when_ready;
 
     lt::torrent_handle h;
-    try
-    {
-        h = ses.add_torrent(params);
-    }
-    catch (std::exception const& e)
-    {
-        std::cerr << "[Fetcher] 异常: 添加种子失败 " << hex_hash << " : " << e.what() << std::endl;
-        return;
-    }
+    h = ses.add_torrent(params);
 
     if (!h.is_valid())
     {
@@ -171,6 +205,7 @@ void fetch_metadata(lt::session &ses, lt::sha1_hash const &info_hash, lt::tcp::e
         return;
     }
 
+    TorrentCleanup cleanup(ses, h);
     h.connect_peer(peer);
 
     for (int i = 0; i < 30; ++i)
@@ -202,20 +237,6 @@ void fetch_metadata(lt::session &ses, lt::sha1_hash const &info_hash, lt::tcp::e
                     std::string peer_str = peer.address().to_string() + ":" + std::to_string(peer.port());
                     db_manager->add_torrent(hex_hash, ti->name(), peer_str);
                     std::cout << "[DB] 已将 " << ti->name() << " 存入数据库。" << std::endl;
-
-                    // 检查并删除 tmp 目录下的残留，使用 system 命令以避免 filesystem 依赖
-                    std::string safe_name = ti->name();
-                    std::string escaped_name;
-                    for (char c : safe_name)
-                    {
-                        if (c == '\'')
-                            escaped_name += "'\\''";
-                        else
-                            escaped_name += c;
-                    }
-                    std::string cmd = "rm -rf 'tmp/" + escaped_name + "'";
-                    system(cmd.c_str());
-                    std::cout << "[Fetcher] 执行清理: " << cmd << std::endl;
                 }
                 catch (std::exception const &e)
                 {
@@ -227,21 +248,33 @@ void fetch_metadata(lt::session &ses, lt::sha1_hash const &info_hash, lt::tcp::e
                 std::cerr << "[Fetcher] 错误: 无法获取 torrent_info " << hex_hash << std::endl;
             }
 
-            // 使用 delete_files 标志清理下载目录
-            ses.remove_torrent(h, lt::session::delete_files);
             return;
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
     std::cerr << "[Fetcher] 超时: " << hex_hash << std::endl;
-    // *** FIX for 2.0.x ***: 使用顶层命名空间的 remove_flags_t
-    ses.remove_torrent(h, lt::session::delete_files);
+}
+
+void fetch_metadata(std::shared_ptr<lt::session> session, lt::sha1_hash const &info_hash, lt::tcp::endpoint const &peer, DatabaseManager* db_manager)
+{
+    try
+    {
+        fetch_metadata_impl(session, info_hash, peer, db_manager);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[Fetcher] 任务异常: " << e.what() << std::endl;
+    }
+    catch (...)
+    {
+        std::cerr << "[Fetcher] 任务发生未知异常" << std::endl;
+    }
 }
 
 DatabaseManager* db_manager_global = nullptr;
 
-void DHTListener(int id)
+void DHTListenerImpl(int id)
 {
     unsigned long long requests = 0, responses = 0;
     lt::settings_pack settings;
@@ -252,11 +285,10 @@ void DHTListener(int id)
 
     settings.set_str(lt::settings_pack::dht_bootstrap_nodes,
                      "dht.libtorrent.org:25401,router.utorrent.com:6881,dht.transmissionbt.com:6881,router.bittorrent.com:6881");
-    char addr[50];
-    sprintf(addr, "%s:%d", bind_address, 6881 + id);
+    const std::string addr = bind_address + ":" + std::to_string(FIRST_LISTEN_PORT + id);
     settings.set_str(lt::settings_pack::listen_interfaces, addr);
 
-    lt::session ses(settings);
+    auto ses = std::make_shared<lt::session>(settings);
     system("mkdir -p torrents");
     system("mkdir -p tmp");
     std::cout << "DHT 爬虫已启动 (libtorrent 2.0.x)，正在监听网络..." << std::endl;
@@ -270,7 +302,7 @@ void DHTListener(int id)
     while (true)
     {
         std::vector<lt::alert *> alerts;
-        ses.pop_alerts(&alerts);
+        ses->pop_alerts(&alerts);
 
         for (lt::alert *a : alerts)
         {
@@ -284,7 +316,7 @@ void DHTListener(int id)
             }
             else if (auto *stat = lt::alert_cast<lt::dht_stats_alert>(a))
             {
-                ses.dht_live_nodes(stat->nid);
+                ses->dht_live_nodes(stat->nid);
             }
             else if (auto *p = lt::alert_cast<lt::dht_pkt_alert>(a))
             {
@@ -339,7 +371,7 @@ void DHTListener(int id)
                                 // *** FIX for 2.0.x ***: 使用 get_endpoint() 成员函数
                                 lt::tcp::endpoint peer(p->node.address(), static_cast<std::uint16_t>(port_val));
 
-                                std::thread(fetch_metadata, std::ref(ses), info_hash, peer, db_manager_global).detach();
+                                std::thread(fetch_metadata, ses, info_hash, peer, db_manager_global).detach();
                             }
                         }
                         else if (dict.dict_find_string_value("q") == "get_peers")
@@ -376,7 +408,7 @@ void DHTListener(int id)
             if (now - last_stats_time > stats_interval)
             {
                 // 请求dht状态
-                ses.post_dht_stats();
+                ses->post_dht_stats();
                 // 重置计时器
                 last_stats_time = now;
             }
@@ -385,6 +417,42 @@ void DHTListener(int id)
         }
     }
     return;
+}
+
+void DHTListener(int id)
+{
+    try
+    {
+        DHTListenerImpl(id);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << id << "[Listener] 线程异常退出: " << e.what() << std::endl;
+    }
+    catch (...)
+    {
+        std::cerr << id << "[Listener] 线程因未知异常退出" << std::endl;
+    }
+}
+
+bool parse_listener_count(const char *text, int &listener_count)
+{
+    if (text == nullptr || *text == '\0')
+        return false;
+
+    int value = 0;
+    const char *end = text;
+    while (*end != '\0')
+        ++end;
+
+    const auto result = std::from_chars(text, end, value);
+    if (result.ec != std::errc{} || result.ptr != end)
+        return false;
+    if (value < MIN_LISTENER_THREADS || value > MAX_LISTENER_THREADS)
+        return false;
+
+    listener_count = value;
+    return true;
 }
 
 int main(int argc, char *argv[])
@@ -396,23 +464,48 @@ int main(int argc, char *argv[])
         std::cout << "已从数据库加载 " << g_seen_hashes.size() << " 个历史 Hash。" << std::endl;
     }
 
+    if (argc > 3)
+    {
+        std::cerr << "用法: " << argv[0] << " [bind_addr] [threads]" << std::endl;
+        return 1;
+    }
+
     int num = 1;
-    if (argc == 3)
+    if (argc >= 2)
     {
-        num = atoi(argv[2]);
-        std::strcpy(bind_address, argv[1]);
+        bind_address = argv[1];
+        if (bind_address.empty())
+        {
+            std::cerr << "绑定地址不能为空" << std::endl;
+            return 1;
+        }
     }
-    else if(argc == 2)
+
+    if (argc == 3 && !parse_listener_count(argv[2], num))
     {
-        std::strcpy(bind_address, argv[1]);
+        std::cerr << "threads 必须是 " << MIN_LISTENER_THREADS
+                  << " 到 " << MAX_LISTENER_THREADS << " 之间的整数" << std::endl;
+        return 1;
     }
-    else{
-        std::strcpy(bind_address, "0.0.0.0");
-    }
+
     std::cout << "绑定地址: " << bind_address << std::endl;
-    while (num--)
+    int started_listeners = 0;
+    for (int id = 0; id < num; ++id)
     {
-        std::thread(DHTListener, num).detach();
+        try
+        {
+            std::thread(DHTListener, id).detach();
+            ++started_listeners;
+        }
+        catch (const std::system_error &e)
+        {
+            std::cerr << "启动监听线程 " << id << " 失败: " << e.what() << std::endl;
+            break;
+        }
+    }
+    if (started_listeners == 0)
+    {
+        return 1;
     }
     while (true)
     {

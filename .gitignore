@@ -1,5 +1,8 @@
 tmp/
 torrents/
+build/
 dht_db
 dht_crawler.db
 *.txt
+!CMakeLists.txt
+.idea/
