@@ -38,8 +38,9 @@ cmake --build build
 目录和 bootstrap 节点等选项。
 
 `bind_addr` 支持 IPv4 和 IPv6。`listeners` 取值范围为 `1-64`，
-表示同一个 libtorrent session 监听的连续端口数量，端口从
-`first-port` 开始。请确保防火墙允许对应端口。
+表示启动的独立 libtorrent session 数量；每个 session 维护自己的
+DHT 状态，并绑定一个连续端口，端口从 `first-port` 开始。请确保
+防火墙允许对应端口。
 
 按 `Ctrl-C` 或发送 `SIGTERM` 可以有序退出。
 

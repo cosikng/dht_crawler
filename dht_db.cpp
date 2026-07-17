@@ -238,6 +238,18 @@ std::string build_listen_interfaces(const Config &config)
     return interfaces;
 }
 
+std::string build_listen_interface(const Config &config, int session_id)
+{
+    const bool ipv6 = config.bind_address.find(':') != std::string::npos;
+    std::string interface;
+    if (ipv6)
+        interface += '[' + config.bind_address + ']';
+    else
+        interface += config.bind_address;
+    interface += ':' + std::to_string(config.first_port + session_id);
+    return interface;
+}
+
 class Statement
 {
 public:
@@ -582,9 +594,12 @@ class CrawlerApp
 public:
     explicit CrawlerApp(Config config)
         : config_(prepare_config(std::move(config))),
-          database_(config_.database_path),
-          session_(create_session(config_))
+          database_(config_.database_path)
     {
+        sessions_.reserve(static_cast<std::size_t>(config_.listeners));
+        for (int id = 0; id < config_.listeners; ++id)
+            sessions_.push_back(std::make_unique<SessionContext>(id, create_session(config_, id)));
+        session_threads_.reserve(sessions_.size());
     }
 
     int run()
@@ -592,50 +607,49 @@ public:
         std::cout << "DHT 爬虫已启动，监听 " << build_listen_interfaces(config_)
                   << "，最大活动任务 " << config_.max_active << '\n';
 
-        auto next_stats = std::chrono::steady_clock::now() + kStatsInterval;
+        for (auto &context : sessions_)
+            session_threads_.emplace_back(&CrawlerApp::run_session, this, context.get());
+
         while (!g_stop_requested)
         {
-            session_.wait_for_alert(kAlertWait);
-
-            std::vector<lt::alert *> alerts;
-            session_.pop_alerts(&alerts);
-            for (lt::alert *alert : alerts)
-            {
-                try
-                {
-                    handle_alert(alert);
-                }
-                catch (const std::exception &error)
-                {
-                    std::cerr << "[Alert] 处理失败: " << error.what() << '\n';
-                }
-                catch (...)
-                {
-                    std::cerr << "[Alert] 处理失败: 未知异常\n";
-                }
-            }
-
-            const auto now = std::chrono::steady_clock::now();
-            expire_tasks(now);
-            poll_database_writes(now);
-            expire_hash_states(now);
-
-            if (now >= next_stats)
-            {
-                session_.post_dht_stats();
-                next_stats = now + kStatsInterval;
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         std::cout << "收到退出信号，正在清理任务...\n";
-        for (const auto &item : active_tasks_)
-            remove_torrent(item.first);
-        active_tasks_.clear();
+        for (std::thread &thread : session_threads_)
+        {
+            if (thread.joinable())
+                thread.join();
+        }
+
+        for (auto &context : sessions_)
+        {
+            for (const auto &item : context->active_tasks)
+                remove_torrent(*context, item.first);
+            context->active_tasks.clear();
+        }
         return 0;
     }
 
 private:
     using TaskMap = std::unordered_map<lt::torrent_handle, ActiveTask>;
+
+    struct SessionContext
+    {
+        SessionContext(int session_id, lt::session session_instance)
+            : id(session_id),
+              session(std::move(session_instance))
+        {
+        }
+
+        int id = 0;
+        lt::session session;
+        std::unordered_map<lt::sha1_hash, HashState> hash_states;
+        TaskMap active_tasks;
+        std::vector<PendingWrite> pending_writes;
+        std::uint64_t requests = 0;
+        std::uint64_t responses = 0;
+    };
 
     static Config prepare_config(Config config)
     {
@@ -657,7 +671,7 @@ private:
         return config;
     }
 
-    static lt::session create_session(const Config &config)
+    static lt::session create_session(const Config &config, int session_id)
     {
         lt::settings_pack settings;
         settings.set_int(
@@ -672,36 +686,82 @@ private:
             config.bootstrap_nodes);
         settings.set_str(
             lt::settings_pack::listen_interfaces,
-            build_listen_interfaces(config));
+            build_listen_interface(config, session_id));
         return lt::session(settings);
     }
 
-    void handle_alert(lt::alert *alert)
+    void run_session(SessionContext *context)
+    {
+        auto next_stats = std::chrono::steady_clock::now() + kStatsInterval;
+        while (!g_stop_requested)
+        {
+            context->session.wait_for_alert(kAlertWait);
+            drain_session(*context);
+
+            const auto now = std::chrono::steady_clock::now();
+            expire_tasks(*context, now);
+            poll_database_writes(*context, now);
+            expire_hash_states(*context, now);
+
+            if (now >= next_stats)
+            {
+                context->session.post_dht_stats();
+                next_stats = now + kStatsInterval;
+            }
+        }
+    }
+
+    void drain_session(SessionContext &context)
+    {
+        std::vector<lt::alert *> alerts;
+        context.session.pop_alerts(&alerts);
+        for (lt::alert *alert : alerts)
+        {
+            try
+            {
+                handle_alert(context, alert);
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr << "[Session " << context.id
+                          << "][Alert] 处理失败: " << error.what() << '\n';
+            }
+            catch (...)
+            {
+                std::cerr << "[Session " << context.id
+                          << "][Alert] 处理失败: 未知异常\n";
+            }
+        }
+    }
+
+    void handle_alert(SessionContext &context, lt::alert *alert)
     {
         if (auto *packet = lt::alert_cast<lt::dht_pkt_alert>(alert))
-            handle_dht_packet(*packet);
+            handle_dht_packet(context, *packet);
         else if (auto *metadata = lt::alert_cast<lt::metadata_received_alert>(alert))
-            handle_metadata(*metadata);
+            handle_metadata(context, *metadata);
         else if (auto *torrent_error = lt::alert_cast<lt::torrent_error_alert>(alert))
-            fail_task(torrent_error->handle, torrent_error->error.message());
+            fail_task(context, torrent_error->handle, torrent_error->error.message());
         else if (auto *stats = lt::alert_cast<lt::dht_stats_alert>(alert))
-            session_.dht_live_nodes(stats->nid);
+            context.session.dht_live_nodes(stats->nid);
         else if (auto *nodes = lt::alert_cast<lt::dht_live_nodes_alert>(alert))
         {
-            std::cout << "[Stats] Nodes: " << nodes->num_nodes()
-                      << " Req: " << requests_
-                      << " Resp: " << responses_
-                      << " Active: " << active_tasks_.size()
-                      << " Persisting: " << pending_writes_.size() << '\n';
+            std::cout << "[Session " << context.id
+                      << "][Stats] Nodes: " << nodes->num_nodes()
+                      << " Req: " << context.requests
+                      << " Resp: " << context.responses
+                      << " Active: " << context.active_tasks.size()
+                      << " Persisting: " << context.pending_writes.size() << '\n';
         }
         else if (lt::alert_cast<lt::listen_failed_alert>(alert)
             || lt::alert_cast<lt::session_error_alert>(alert))
         {
-            std::cerr << "[libtorrent] " << alert->message() << '\n';
+            std::cerr << "[Session " << context.id
+                      << "][libtorrent] " << alert->message() << '\n';
         }
     }
 
-    void handle_dht_packet(const lt::dht_pkt_alert &packet)
+    void handle_dht_packet(SessionContext &context, const lt::dht_pkt_alert &packet)
     {
         if (packet.direction != lt::dht_pkt_alert::incoming)
             return;
@@ -713,11 +773,11 @@ private:
 
         if (message.dict_find_string_value("y") != "q")
         {
-            ++responses_;
+            ++context.responses;
             return;
         }
 
-        ++requests_;
+        ++context.requests;
         if (message.dict_find_string_value("q") != "announce_peer")
             return;
 
@@ -746,17 +806,18 @@ private:
             return;
 
         submit_task(
+            context,
             hash,
             lt::tcp::endpoint(
                 packet.node.address(),
                 static_cast<std::uint16_t>(port)));
     }
 
-    void submit_task(const lt::sha1_hash &hash, const lt::tcp::endpoint &peer)
+    void submit_task(SessionContext &context, const lt::sha1_hash &hash, const lt::tcp::endpoint &peer)
     {
         const auto now = std::chrono::steady_clock::now();
-        auto state = hash_states_.find(hash);
-        if (state != hash_states_.end())
+        auto state = context.hash_states.find(hash);
+        if (state != context.hash_states.end())
         {
             if (state->second.status != HashStatus::failed
                 || now < state->second.retry_after)
@@ -765,9 +826,9 @@ private:
             }
         }
 
-        if (active_tasks_.size() >= config_.max_active)
+        if (context.active_tasks.size() >= config_.max_active)
         {
-            hash_states_[hash] = {HashStatus::failed, now + config_.retry_delay};
+            context.hash_states[hash] = {HashStatus::failed, now + config_.retry_delay};
             return;
         }
 
@@ -776,7 +837,7 @@ private:
         {
             if (database_.contains(hash_hex))
             {
-                hash_states_[hash] = {
+                context.hash_states[hash] = {
                     HashStatus::completed,
                     now + kCompletedCacheLifetime};
                 return;
@@ -787,35 +848,36 @@ private:
             parameters.save_path = config_.temp_dir.string();
             parameters.flags |= lt::torrent_flags::upload_mode;
 
-            lt::torrent_handle handle = session_.add_torrent(std::move(parameters));
+            lt::torrent_handle handle = context.session.add_torrent(std::move(parameters));
             if (!handle.is_valid())
             {
-                mark_failed(hash, now);
+                mark_failed(context, hash, now);
                 return;
             }
 
             handle.connect_peer(peer);
-            active_tasks_.emplace(
+            context.active_tasks.emplace(
                 handle,
                 ActiveTask{
                     hash,
                     hash_hex,
                     peer,
                     now + config_.metadata_timeout});
-            hash_states_[hash] = {HashStatus::active, {}};
+            context.hash_states[hash] = {HashStatus::active, {}};
         }
         catch (const std::exception &error)
         {
-            std::cerr << "[Fetcher] 启动 " << hash_hex
+            std::cerr << "[Session " << context.id
+                      << "][Fetcher] 启动 " << hash_hex
                       << " 失败: " << error.what() << '\n';
-            mark_failed(hash, now);
+            mark_failed(context, hash, now);
         }
     }
 
-    void handle_metadata(const lt::metadata_received_alert &alert)
+    void handle_metadata(SessionContext &context, const lt::metadata_received_alert &alert)
     {
-        auto task_iterator = active_tasks_.find(alert.handle);
-        if (task_iterator == active_tasks_.end())
+        auto task_iterator = context.active_tasks.find(alert.handle);
+        if (task_iterator == context.active_tasks.end())
             return;
 
         ActiveTask task = task_iterator->second;
@@ -834,21 +896,23 @@ private:
                 task.hash_hex,
                 torrent_info->name(),
                 format_endpoint(task.peer)};
-            pending_writes_.push_back(PendingWrite{
+            context.pending_writes.push_back(PendingWrite{
                 task.hash,
                 task.hash_hex,
                 database_.enqueue(std::move(record))});
-            hash_states_[task.hash] = {HashStatus::persisting, {}};
-            std::cout << "[Fetcher] 已获取 " << task.hash_hex << " 的元数据\n";
+            context.hash_states[task.hash] = {HashStatus::persisting, {}};
+            std::cout << "[Session " << context.id
+                      << "][Fetcher] 已获取 " << task.hash_hex << " 的元数据\n";
         }
         catch (const std::exception &error)
         {
-            std::cerr << "[Fetcher] 保存 " << task.hash_hex
+            std::cerr << "[Session " << context.id
+                      << "][Fetcher] 保存 " << task.hash_hex
                       << " 失败: " << error.what() << '\n';
-            mark_failed(task.hash, std::chrono::steady_clock::now());
+            mark_failed(context, task.hash, std::chrono::steady_clock::now());
         }
 
-        remove_task(task_iterator);
+        remove_task(context, task_iterator);
     }
 
     void write_torrent_file(
@@ -894,9 +958,9 @@ private:
         }
     }
 
-    void expire_tasks(std::chrono::steady_clock::time_point now)
+    void expire_tasks(SessionContext &context, std::chrono::steady_clock::time_point now)
     {
-        for (auto iterator = active_tasks_.begin(); iterator != active_tasks_.end();)
+        for (auto iterator = context.active_tasks.begin(); iterator != context.active_tasks.end();)
         {
             if (iterator->second.deadline > now)
             {
@@ -904,15 +968,16 @@ private:
                 continue;
             }
 
-            std::cerr << "[Fetcher] 超时: " << iterator->second.hash_hex << '\n';
-            mark_failed(iterator->second.hash, now);
-            iterator = remove_task(iterator);
+            std::cerr << "[Session " << context.id
+                      << "][Fetcher] 超时: " << iterator->second.hash_hex << '\n';
+            mark_failed(context, iterator->second.hash, now);
+            iterator = remove_task(context, iterator);
         }
     }
 
-    void poll_database_writes(std::chrono::steady_clock::time_point now)
+    void poll_database_writes(SessionContext &context, std::chrono::steady_clock::time_point now)
     {
-        for (auto iterator = pending_writes_.begin(); iterator != pending_writes_.end();)
+        for (auto iterator = context.pending_writes.begin(); iterator != context.pending_writes.end();)
         {
             if (iterator->result.wait_for(std::chrono::seconds(0))
                 != std::future_status::ready)
@@ -923,29 +988,31 @@ private:
 
             if (iterator->result.get())
             {
-                hash_states_[iterator->hash] = {
+                context.hash_states[iterator->hash] = {
                     HashStatus::completed,
                     now + kCompletedCacheLifetime};
-                std::cout << "[DB] 已保存 " << iterator->hash_hex << '\n';
+                std::cout << "[Session " << context.id
+                          << "][DB] 已保存 " << iterator->hash_hex << '\n';
             }
             else
             {
-                std::cerr << "[DB] 保存失败: " << iterator->hash_hex << '\n';
-                mark_failed(iterator->hash, now);
+                std::cerr << "[Session " << context.id
+                          << "][DB] 保存失败: " << iterator->hash_hex << '\n';
+                mark_failed(context, iterator->hash, now);
             }
-            iterator = pending_writes_.erase(iterator);
+            iterator = context.pending_writes.erase(iterator);
         }
     }
 
-    void expire_hash_states(std::chrono::steady_clock::time_point now)
+    void expire_hash_states(SessionContext &context, std::chrono::steady_clock::time_point now)
     {
-        for (auto iterator = hash_states_.begin(); iterator != hash_states_.end();)
+        for (auto iterator = context.hash_states.begin(); iterator != context.hash_states.end();)
         {
             if ((iterator->second.status == HashStatus::failed
                     || iterator->second.status == HashStatus::completed)
                 && iterator->second.retry_after <= now)
             {
-                iterator = hash_states_.erase(iterator);
+                iterator = context.hash_states.erase(iterator);
             }
             else
             {
@@ -954,55 +1021,54 @@ private:
         }
     }
 
-    void fail_task(const lt::torrent_handle &handle, const std::string &reason)
+    void fail_task(SessionContext &context, const lt::torrent_handle &handle, const std::string &reason)
     {
-        auto iterator = active_tasks_.find(handle);
-        if (iterator == active_tasks_.end())
+        auto iterator = context.active_tasks.find(handle);
+        if (iterator == context.active_tasks.end())
             return;
 
-        std::cerr << "[Fetcher] " << iterator->second.hash_hex
+        std::cerr << "[Session " << context.id
+                  << "][Fetcher] " << iterator->second.hash_hex
                   << " 失败: " << reason << '\n';
-        mark_failed(iterator->second.hash, std::chrono::steady_clock::now());
-        remove_task(iterator);
+        mark_failed(context, iterator->second.hash, std::chrono::steady_clock::now());
+        remove_task(context, iterator);
     }
 
     void mark_failed(
+        SessionContext &context,
         const lt::sha1_hash &hash,
         std::chrono::steady_clock::time_point now)
     {
-        hash_states_[hash] = {HashStatus::failed, now + config_.retry_delay};
+        context.hash_states[hash] = {HashStatus::failed, now + config_.retry_delay};
     }
 
-    void remove_torrent(const lt::torrent_handle &handle)
+    void remove_torrent(SessionContext &context, const lt::torrent_handle &handle)
     {
         if (!handle.is_valid())
             return;
         try
         {
-            session_.remove_torrent(handle, lt::session::delete_files);
+            context.session.remove_torrent(handle, lt::session::delete_files);
         }
         catch (const std::exception &error)
         {
-            std::cerr << "[Fetcher] 清理 torrent 失败: " << error.what() << '\n';
+            std::cerr << "[Session " << context.id
+                      << "][Fetcher] 清理 torrent 失败: " << error.what() << '\n';
         }
     }
 
-    TaskMap::iterator remove_task(TaskMap::iterator iterator)
+    TaskMap::iterator remove_task(SessionContext &context, TaskMap::iterator iterator)
     {
         const lt::torrent_handle handle = iterator->first;
-        auto next = active_tasks_.erase(iterator);
-        remove_torrent(handle);
+        auto next = context.active_tasks.erase(iterator);
+        remove_torrent(context, handle);
         return next;
     }
 
     Config config_;
     DatabaseManager database_;
-    lt::session session_;
-    std::unordered_map<lt::sha1_hash, HashState> hash_states_;
-    TaskMap active_tasks_;
-    std::vector<PendingWrite> pending_writes_;
-    std::uint64_t requests_ = 0;
-    std::uint64_t responses_ = 0;
+    std::vector<std::unique_ptr<SessionContext>> sessions_;
+    std::vector<std::thread> session_threads_;
 };
 
 } // namespace
