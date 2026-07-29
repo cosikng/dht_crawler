@@ -35,14 +35,21 @@ cmake --build build
 ```
 
 使用 `./build/dht_db --help` 查看数据库路径、临时目录、torrent
-目录和 bootstrap 节点等选项。
+目录、DHT 状态目录和 bootstrap 节点等选项。
 
 `bind_addr` 支持 IPv4 和 IPv6。`listeners` 取值范围为 `1-64`，
 表示启动的独立 libtorrent session 数量；每个 session 维护自己的
 DHT 状态，并绑定一个连续端口，端口从 `first-port` 开始。请确保
 防火墙允许对应端口。
 
-按 `Ctrl-C` 或发送 `SIGTERM` 可以有序退出。
+按 `Ctrl-C` 或发送 `SIGTERM` 可以有序退出。退出前，程序会把每个
+session 的节点 ID 和 libtorrent 导出的 DHT 路由状态分别保存到
+`dht_state/session-<session-id>-port-<port>.state`。下次以相同端口启动时
+会默认加载对应状态，从而保持节点 ID 并加快重新加入 DHT 网络。
+
+可以用 `--dht-state-dir PATH` 修改状态目录。需要放弃已有节点 ID 和路由状态时，
+使用 `--reinitialize-dht` 启动；程序会在启动时删除对应旧状态，新状态会在本次
+程序有序退出时写入。
 
 ### 结果查看
 

@@ -29,6 +29,7 @@
 #include <libtorrent/entry.hpp>
 #include <libtorrent/hex.hpp>
 #include <libtorrent/session.hpp>
+#include <libtorrent/session_params.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/sha1_hash.hpp>
 #include <libtorrent/torrent_info.hpp>
@@ -67,6 +68,8 @@ struct Config
     fs::path database_path = "dht_crawler.db";
     fs::path temp_dir = "tmp";
     fs::path torrent_dir = "torrents";
+    fs::path dht_state_dir = "dht_state";
+    bool reinitialize_dht = false;
     std::string bootstrap_nodes =
         "dht.libtorrent.org:25401,"
         "router.utorrent.com:6881,"
@@ -116,6 +119,8 @@ void print_usage(const char *program)
         << "  --database PATH            SQLite 数据库路径\n"
         << "  --temp-dir PATH            libtorrent 临时目录\n"
         << "  --torrent-dir PATH         torrent 文件目录\n"
+        << "  --dht-state-dir PATH       DHT 状态目录，默认 dht_state\n"
+        << "  --reinitialize-dht         忽略已有状态并重新初始化 DHT\n"
         << "  --bootstrap-nodes NODES    DHT bootstrap 节点列表\n"
         << "  --help                     显示帮助\n";
 }
@@ -137,6 +142,12 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
         for (int i = 1; i < argc; ++i)
         {
             const std::string_view option(argv[i]);
+            if (option == "--reinitialize-dht")
+            {
+                config.reinitialize_dht = true;
+                continue;
+            }
+
             if (i + 1 >= argc)
                 return std::nullopt;
 
@@ -174,6 +185,8 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
                 config.temp_dir = value;
             else if (option == "--torrent-dir")
                 config.torrent_dir = value;
+            else if (option == "--dht-state-dir")
+                config.dht_state_dir = value;
             else if (option == "--bootstrap-nodes")
                 config.bootstrap_nodes = value;
             else
@@ -191,6 +204,7 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
         || config.database_path.empty()
         || config.temp_dir.empty()
         || config.torrent_dir.empty()
+        || config.dht_state_dir.empty()
         || config.bootstrap_nodes.empty())
     {
         return std::nullopt;
@@ -615,20 +629,23 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        std::cout << "收到退出信号，正在清理任务...\n";
+        std::cout << "收到退出信号，正在停止会话...\n";
         for (std::thread &thread : session_threads_)
         {
             if (thread.joinable())
                 thread.join();
         }
 
+        const bool state_saved = save_dht_states();
+
+        std::cout << "正在清理任务...\n";
         for (auto &context : sessions_)
         {
             for (const auto &item : context->active_tasks)
                 remove_torrent(*context, item.first);
             context->active_tasks.clear();
         }
-        return 0;
+        return state_saved ? 0 : 1;
     }
 
 private:
@@ -666,9 +683,78 @@ private:
 
         create_directory(config.temp_dir, "临时目录");
         create_directory(config.torrent_dir, " torrent 目录");
+        create_directory(config.dht_state_dir, " DHT 状态目录");
         if (config.database_path.has_parent_path())
             create_directory(config.database_path.parent_path(), "数据库目录");
         return config;
+    }
+
+    static fs::path dht_state_path(const Config &config, int session_id)
+    {
+        const int port = config.first_port + session_id;
+        return config.dht_state_dir
+            / ("session-" + std::to_string(session_id)
+                + "-port-" + std::to_string(port) + ".state");
+    }
+
+    static std::vector<char> read_binary_file(const fs::path &path)
+    {
+        std::ifstream input(path, std::ios::binary | std::ios::ate);
+        if (!input)
+            throw std::runtime_error("无法打开 DHT 状态文件 " + path.string());
+
+        const std::streampos end = input.tellg();
+        if (end <= 0)
+            throw std::runtime_error("DHT 状态文件为空 " + path.string());
+
+        std::vector<char> buffer(static_cast<std::size_t>(end));
+        input.seekg(0, std::ios::beg);
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        if (!input)
+            throw std::runtime_error("读取 DHT 状态文件失败 " + path.string());
+        return buffer;
+    }
+
+    static void write_binary_file_atomic(
+        const fs::path &target_path,
+        const std::vector<char> &buffer)
+    {
+        fs::path temporary_path = target_path;
+        temporary_path += ".tmp";
+
+        {
+            std::ofstream output(
+                temporary_path,
+                std::ios::binary | std::ios::trunc);
+            if (!output)
+            {
+                throw std::runtime_error(
+                    "无法打开 DHT 临时状态文件 " + temporary_path.string());
+            }
+
+            output.write(
+                buffer.data(),
+                static_cast<std::streamsize>(buffer.size()));
+            output.close();
+            if (!output)
+            {
+                std::error_code ignored;
+                fs::remove(temporary_path, ignored);
+                throw std::runtime_error(
+                    "写入 DHT 临时状态文件失败 " + temporary_path.string());
+            }
+        }
+
+        std::error_code error;
+        fs::rename(temporary_path, target_path, error);
+        if (error)
+        {
+            std::error_code ignored;
+            fs::remove(temporary_path, ignored);
+            throw std::runtime_error(
+                "发布 DHT 状态文件失败 " + target_path.string()
+                + ": " + error.message());
+        }
     }
 
     static lt::session create_session(const Config &config, int session_id)
@@ -687,7 +773,111 @@ private:
         settings.set_str(
             lt::settings_pack::listen_interfaces,
             build_listen_interface(config, session_id));
-        return lt::session(settings);
+
+        lt::session_params parameters(std::move(settings));
+        const fs::path state_path = dht_state_path(config, session_id);
+        if (config.reinitialize_dht)
+        {
+            std::error_code error;
+            const bool removed = fs::remove(state_path, error);
+            if (error)
+            {
+                throw std::runtime_error(
+                    "删除旧 DHT 状态失败 " + state_path.string()
+                    + ": " + error.message());
+            }
+
+            std::cout << "[Session " << session_id << "][DHT] "
+                      << (removed ? "已删除旧状态并重新初始化"
+                                  : "没有旧状态，正在重新初始化")
+                      << '\n';
+        }
+        else
+        {
+            std::error_code error;
+            const bool state_exists = fs::exists(state_path, error);
+            if (error)
+            {
+                throw std::runtime_error(
+                    "检查 DHT 状态文件失败 " + state_path.string()
+                    + ": " + error.message());
+            }
+
+            if (state_exists)
+            {
+                try
+                {
+                    std::vector<char> buffer = read_binary_file(state_path);
+                    lt::session_params restored = lt::read_session_params(
+                        buffer,
+                        lt::session_handle::save_dht_state);
+                    if (restored.dht_state.nids.empty())
+                    {
+                        throw std::runtime_error(
+                            "状态中没有可恢复的 DHT 节点 ID");
+                    }
+
+                    const std::size_t node_ids = restored.dht_state.nids.size();
+                    const std::size_t nodes =
+                        restored.dht_state.nodes.size()
+                        + restored.dht_state.nodes6.size();
+                    parameters.dht_state = std::move(restored.dht_state);
+                    std::cout << "[Session " << session_id
+                              << "][DHT] 已加载状态 " << state_path
+                              << "，节点 ID " << node_ids
+                              << "，引导节点 " << nodes << '\n';
+                }
+                catch (const std::exception &error)
+                {
+                    throw std::runtime_error(
+                        "加载 DHT 状态失败 " + state_path.string()
+                        + ": " + error.what()
+                        + "；如需丢弃旧状态，请使用 --reinitialize-dht");
+                }
+            }
+        }
+
+        return lt::session(std::move(parameters));
+    }
+
+    bool save_dht_states()
+    {
+        bool all_saved = true;
+        for (const auto &context : sessions_)
+        {
+            const fs::path state_path = dht_state_path(config_, context->id);
+            try
+            {
+                lt::session_params parameters = context->session.session_state(
+                    lt::session_handle::save_dht_state);
+                if (parameters.dht_state.nids.empty())
+                {
+                    throw std::runtime_error(
+                        "当前会话没有可保存的 DHT 节点 ID");
+                }
+
+                const std::size_t node_ids = parameters.dht_state.nids.size();
+                const std::size_t nodes =
+                    parameters.dht_state.nodes.size()
+                    + parameters.dht_state.nodes6.size();
+                std::vector<char> buffer = lt::write_session_params_buf(
+                    parameters,
+                    lt::session_handle::save_dht_state);
+                write_binary_file_atomic(state_path, buffer);
+
+                std::cout << "[Session " << context->id
+                          << "][DHT] 已保存状态 " << state_path
+                          << "，节点 ID " << node_ids
+                          << "，引导节点 " << nodes << '\n';
+            }
+            catch (const std::exception &error)
+            {
+                all_saved = false;
+                std::cerr << "[Session " << context->id
+                          << "][DHT] 保存状态失败: " << error.what() << '\n';
+            }
+        }
+        return all_saved;
     }
 
     void run_session(SessionContext *context)
