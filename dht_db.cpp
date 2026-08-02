@@ -1,3 +1,5 @@
+#include "simple_network.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -13,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -49,6 +52,9 @@ constexpr auto kDatabaseBatchDelay = std::chrono::milliseconds(100);
 constexpr auto kAlertWait = std::chrono::milliseconds(250);
 constexpr auto kStatsInterval = std::chrono::seconds(60);
 constexpr auto kCompletedCacheLifetime = std::chrono::minutes(10);
+constexpr std::size_t kTrackerRpcWorkers = 4;
+constexpr std::size_t kTrackerRpcQueueSize = 128;
+constexpr std::size_t kMaxTrackerPeers = 512;
 
 volatile std::sig_atomic_t g_stop_requested = 0;
 
@@ -70,6 +76,10 @@ struct Config
     fs::path torrent_dir = "torrents";
     fs::path dht_state_dir = "dht_state";
     bool reinitialize_dht = false;
+    std::string tracker_rpc_bind = "127.0.0.1";
+    int tracker_rpc_port = 19091;
+    std::chrono::seconds tracker_lookup_timeout{8};
+    bool tracker_rpc_enabled = true;
     std::string bootstrap_nodes =
         "dht.libtorrent.org:25401,"
         "router.utorrent.com:6881,"
@@ -121,6 +131,10 @@ void print_usage(const char *program)
         << "  --torrent-dir PATH         torrent 文件目录\n"
         << "  --dht-state-dir PATH       DHT 状态目录，默认 dht_state\n"
         << "  --reinitialize-dht         忽略已有状态并重新初始化 DHT\n"
+        << "  --tracker-rpc-bind ADDRESS tracker RPC 地址，默认 127.0.0.1\n"
+        << "  --tracker-rpc-port PORT    tracker RPC 端口，默认 19091\n"
+        << "  --tracker-timeout SEC      DHT 查询超时，默认 8 秒\n"
+        << "  --disable-tracker-rpc      禁用 tracker RPC 服务\n"
         << "  --bootstrap-nodes NODES    DHT bootstrap 节点列表\n"
         << "  --help                     显示帮助\n";
 }
@@ -142,9 +156,13 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
         for (int i = 1; i < argc; ++i)
         {
             const std::string_view option(argv[i]);
-            if (option == "--reinitialize-dht")
+            if (option == "--reinitialize-dht"
+                || option == "--disable-tracker-rpc")
             {
-                config.reinitialize_dht = true;
+                if (option == "--reinitialize-dht")
+                    config.reinitialize_dht = true;
+                else
+                    config.tracker_rpc_enabled = false;
                 continue;
             }
 
@@ -187,6 +205,18 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
                 config.torrent_dir = value;
             else if (option == "--dht-state-dir")
                 config.dht_state_dir = value;
+            else if (option == "--tracker-rpc-bind")
+                config.tracker_rpc_bind = value;
+            else if (option == "--tracker-rpc-port")
+            {
+                if (!parse_integer(value, config.tracker_rpc_port))
+                    return std::nullopt;
+            }
+            else if (option == "--tracker-timeout")
+            {
+                if (!parse_positive_seconds(value, config.tracker_lookup_timeout))
+                    return std::nullopt;
+            }
             else if (option == "--bootstrap-nodes")
                 config.bootstrap_nodes = value;
             else
@@ -205,6 +235,10 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
         || config.temp_dir.empty()
         || config.torrent_dir.empty()
         || config.dht_state_dir.empty()
+        || config.tracker_rpc_bind.empty()
+        || config.tracker_rpc_port <= 0
+        || config.tracker_rpc_port > kMaxPort
+        || config.tracker_lookup_timeout > std::chrono::seconds(300)
         || config.bootstrap_nodes.empty())
     {
         return std::nullopt;
@@ -219,12 +253,49 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
         return std::nullopt;
     }
 
+    lt::make_address(config.tracker_rpc_bind, error);
+    if (error)
+    {
+        std::cerr << "无效 tracker RPC 绑定地址: "
+                  << config.tracker_rpc_bind
+                  << " (" << error.message() << ")\n";
+        return std::nullopt;
+    }
+
     return config;
 }
 
 std::string hash_to_hex(const lt::sha1_hash &hash)
 {
     return lt::aux::to_hex(hash.to_string());
+}
+
+int hex_value(char character)
+{
+    if (character >= '0' && character <= '9')
+        return character - '0';
+    if (character >= 'a' && character <= 'f')
+        return character - 'a' + 10;
+    if (character >= 'A' && character <= 'F')
+        return character - 'A' + 10;
+    return -1;
+}
+
+std::optional<lt::sha1_hash> hash_from_hex(std::string_view text)
+{
+    if (text.size() != static_cast<std::size_t>(lt::sha1_hash::size() * 2))
+        return std::nullopt;
+
+    lt::sha1_hash hash;
+    for (int i = 0; i < lt::sha1_hash::size(); ++i)
+    {
+        const int high = hex_value(text[static_cast<std::size_t>(i * 2)]);
+        const int low = hex_value(text[static_cast<std::size_t>(i * 2 + 1)]);
+        if (high < 0 || low < 0)
+            return std::nullopt;
+        hash[i] = static_cast<std::uint8_t>((high << 4) | low);
+    }
+    return hash;
 }
 
 std::string format_endpoint(const lt::tcp::endpoint &endpoint)
@@ -624,12 +695,18 @@ public:
         for (auto &context : sessions_)
             session_threads_.emplace_back(&CrawlerApp::run_session, this, context.get());
 
+        start_tracker_rpc();
+
         while (!g_stop_requested)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         std::cout << "收到退出信号，正在停止会话...\n";
+        lookup_stopping_.store(true);
+        cancel_pending_lookups("DHT 爬虫正在退出");
+        tracker_rpc_server_.stop();
+
         for (std::thread &thread : session_threads_)
         {
             if (thread.joinable())
@@ -650,6 +727,30 @@ public:
 
 private:
     using TaskMap = std::unordered_map<lt::torrent_handle, ActiveTask>;
+
+    enum class LookupStatus
+    {
+        ok,
+        timeout,
+        error
+    };
+
+    struct LookupReply
+    {
+        LookupStatus status = LookupStatus::error;
+        std::vector<lt::tcp::endpoint> peers;
+        std::string error;
+    };
+
+    struct PendingLookup
+    {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool completed = false;
+        std::vector<lt::tcp::endpoint> peers;
+        std::string error;
+        std::size_t waiters = 0;
+    };
 
     struct SessionContext
     {
@@ -764,7 +865,8 @@ private:
             lt::settings_pack::alert_mask,
             lt::alert_category::dht_log
                 | lt::alert_category::status
-                | lt::alert_category::error);
+                | lt::alert_category::error
+                | lt::alert_category::dht_operation);
         settings.set_bool(lt::settings_pack::enable_dht, true);
         settings.set_bool(lt::settings_pack::enable_lsd, false);
         settings.set_str(
@@ -880,6 +982,232 @@ private:
         return all_saved;
     }
 
+    void start_tracker_rpc()
+    {
+        if (!config_.tracker_rpc_enabled)
+        {
+            std::cout << "[Tracker RPC] 已禁用\n";
+            return;
+        }
+
+        try
+        {
+            tracker_rpc_server_.start(
+                config_.tracker_rpc_bind,
+                static_cast<std::uint16_t>(config_.tracker_rpc_port),
+                kTrackerRpcWorkers,
+                kTrackerRpcQueueSize,
+                [this](int socket, const std::string &remote) {
+                    handle_tracker_rpc(socket, remote);
+                });
+            std::cout << "[Tracker RPC] 监听 "
+                      << config_.tracker_rpc_bind << ':'
+                      << config_.tracker_rpc_port << '\n';
+        }
+        catch (const std::exception &error)
+        {
+            std::cerr << "[Tracker RPC] 启动失败，DHT 爬虫继续运行: "
+                      << error.what() << '\n';
+        }
+    }
+
+    void handle_tracker_rpc(int socket, const std::string &remote)
+    {
+        const int socket_timeout =
+            static_cast<int>(config_.tracker_lookup_timeout.count() * 1000 + 2000);
+        simple_net::set_socket_timeouts(socket, socket_timeout);
+
+        std::string request;
+        std::string network_error;
+        if (!simple_net::read_until(
+                socket,
+                request,
+                "\n",
+                256,
+                network_error))
+        {
+            return;
+        }
+
+        const std::size_t newline = request.find('\n');
+        request.resize(newline);
+        if (!request.empty() && request.back() == '\r')
+            request.pop_back();
+
+        std::istringstream parser(request);
+        std::string protocol;
+        std::string command;
+        std::string hash_text;
+        std::string extra;
+        parser >> protocol >> command >> hash_text;
+        parser >> extra;
+        const std::optional<lt::sha1_hash> hash = hash_from_hex(hash_text);
+        if (protocol != "DHTP/1"
+            || command != "GET_PEERS"
+            || !hash
+            || !extra.empty())
+        {
+            std::string ignored;
+            simple_net::write_all(
+                socket,
+                "DHTP/1 ERROR invalid-request\nEND\n",
+                ignored);
+            return;
+        }
+
+        std::cout << "[Tracker RPC] " << remote
+                  << " 查询 " << hash_text << '\n';
+        LookupReply reply = lookup_dht_peers(*hash);
+
+        std::ostringstream response;
+        if (reply.status == LookupStatus::ok)
+        {
+            response << "DHTP/1 OK " << reply.peers.size() << '\n';
+            for (const lt::tcp::endpoint &peer : reply.peers)
+            {
+                response << "PEER "
+                         << (peer.address().is_v6() ? 6 : 4) << ' '
+                         << peer.address().to_string() << ' '
+                         << peer.port() << '\n';
+            }
+        }
+        else if (reply.status == LookupStatus::timeout)
+        {
+            response << "DHTP/1 TIMEOUT\n";
+        }
+        else
+        {
+            response << "DHTP/1 ERROR lookup-failed\n";
+        }
+        response << "END\n";
+
+        simple_net::write_all(socket, response.str(), network_error);
+    }
+
+    LookupReply lookup_dht_peers(const lt::sha1_hash &hash)
+    {
+        if (lookup_stopping_.load() || sessions_.empty())
+            return {LookupStatus::error, {}, "DHT 查询服务不可用"};
+
+        std::shared_ptr<PendingLookup> pending;
+        bool start_lookup = false;
+        std::size_t session_index = 0;
+        {
+            std::lock_guard<std::mutex> lock(lookup_mutex_);
+            auto iterator = pending_lookups_.find(hash);
+            if (iterator != pending_lookups_.end())
+            {
+                pending = iterator->second;
+            }
+            else
+            {
+                pending = std::make_shared<PendingLookup>();
+                pending_lookups_.emplace(hash, pending);
+                session_index =
+                    next_lookup_session_.fetch_add(1) % sessions_.size();
+                start_lookup = true;
+            }
+            ++pending->waiters;
+        }
+
+        if (start_lookup)
+        {
+            try
+            {
+                sessions_[session_index]->session.dht_get_peers(hash);
+            }
+            catch (const std::exception &error)
+            {
+                complete_lookup(hash, {}, error.what());
+            }
+        }
+
+        std::unique_lock<std::mutex> result_lock(pending->mutex);
+        const bool completed = pending->condition.wait_for(
+            result_lock,
+            config_.tracker_lookup_timeout,
+            [&pending] { return pending->completed; });
+        if (completed)
+        {
+            if (!pending->error.empty())
+                return {LookupStatus::error, {}, pending->error};
+            return {LookupStatus::ok, pending->peers, {}};
+        }
+        result_lock.unlock();
+
+        {
+            std::lock_guard<std::mutex> lock(lookup_mutex_);
+            auto iterator = pending_lookups_.find(hash);
+            if (iterator != pending_lookups_.end()
+                && iterator->second == pending)
+            {
+                if (pending->waiters > 0)
+                    --pending->waiters;
+                if (pending->waiters == 0)
+                    pending_lookups_.erase(iterator);
+            }
+        }
+
+        result_lock.lock();
+        if (pending->completed)
+        {
+            if (!pending->error.empty())
+                return {LookupStatus::error, {}, pending->error};
+            return {LookupStatus::ok, pending->peers, {}};
+        }
+        return {LookupStatus::timeout, {}, "DHT 查询超时"};
+    }
+
+    void complete_lookup(
+        const lt::sha1_hash &hash,
+        std::vector<lt::tcp::endpoint> peers,
+        std::string error = {})
+    {
+        std::shared_ptr<PendingLookup> pending;
+        {
+            std::lock_guard<std::mutex> lock(lookup_mutex_);
+            auto iterator = pending_lookups_.find(hash);
+            if (iterator == pending_lookups_.end())
+                return;
+            pending = std::move(iterator->second);
+            pending_lookups_.erase(iterator);
+        }
+
+        std::sort(peers.begin(), peers.end());
+        peers.erase(std::unique(peers.begin(), peers.end()), peers.end());
+        if (peers.size() > kMaxTrackerPeers)
+            peers.resize(kMaxTrackerPeers);
+        {
+            std::lock_guard<std::mutex> lock(pending->mutex);
+            pending->peers = std::move(peers);
+            pending->error = std::move(error);
+            pending->completed = true;
+        }
+        pending->condition.notify_all();
+    }
+
+    void cancel_pending_lookups(const std::string &reason)
+    {
+        std::vector<std::shared_ptr<PendingLookup>> pending;
+        {
+            std::lock_guard<std::mutex> lock(lookup_mutex_);
+            pending.reserve(pending_lookups_.size());
+            for (auto &item : pending_lookups_)
+                pending.push_back(std::move(item.second));
+            pending_lookups_.clear();
+        }
+
+        for (const auto &lookup : pending)
+        {
+            {
+                std::lock_guard<std::mutex> lock(lookup->mutex);
+                lookup->error = reason;
+                lookup->completed = true;
+            }
+            lookup->condition.notify_all();
+        }
+    }
+
     void run_session(SessionContext *context)
     {
         auto next_stats = std::chrono::steady_clock::now() + kStatsInterval;
@@ -932,6 +1260,8 @@ private:
             handle_metadata(context, *metadata);
         else if (auto *torrent_error = lt::alert_cast<lt::torrent_error_alert>(alert))
             fail_task(context, torrent_error->handle, torrent_error->error.message());
+        else if (auto *reply = lt::alert_cast<lt::dht_get_peers_reply_alert>(alert))
+            complete_lookup(reply->info_hash, reply->peers());
         else if (auto *stats = lt::alert_cast<lt::dht_stats_alert>(alert))
             context.session.dht_live_nodes(stats->nid);
         else if (auto *nodes = lt::alert_cast<lt::dht_live_nodes_alert>(alert))
@@ -1259,6 +1589,11 @@ private:
     DatabaseManager database_;
     std::vector<std::unique_ptr<SessionContext>> sessions_;
     std::vector<std::thread> session_threads_;
+    simple_net::TcpServer tracker_rpc_server_;
+    std::mutex lookup_mutex_;
+    std::unordered_map<lt::sha1_hash, std::shared_ptr<PendingLookup>> pending_lookups_;
+    std::atomic<std::size_t> next_lookup_session_{0};
+    std::atomic<bool> lookup_stopping_{false};
 };
 
 } // namespace

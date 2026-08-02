@@ -29,20 +29,31 @@ else()
     set(LIBTORRENT_TARGET PkgConfig::LibtorrentRasterbar)
 endif()
 
+add_library(simple_network STATIC simple_network.cpp)
+target_compile_features(simple_network PUBLIC cxx_std_17)
+target_include_directories(simple_network PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(simple_network PUBLIC Threads::Threads)
+
 add_executable(dht_db dht_db.cpp)
-
 target_compile_features(dht_db PRIVATE cxx_std_17)
-target_compile_options(
-    dht_db
-    PRIVATE
-        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
-        $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
-
 target_link_libraries(
     dht_db
     PRIVATE
+        simple_network
         ${LIBTORRENT_TARGET}
         ${SQLITE_TARGET}
         Threads::Threads
 )
+
+add_executable(tracker_server tracker_server.cpp)
+target_compile_features(tracker_server PRIVATE cxx_std_17)
+target_link_libraries(tracker_server PRIVATE simple_network Threads::Threads)
+
+foreach(target simple_network dht_db tracker_server)
+    target_compile_options(
+        ${target}
+        PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
+            $<$<CXX_COMPILER_ID:MSVC>:/W4>
+    )
+endforeach()
