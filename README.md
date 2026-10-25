@@ -7,10 +7,16 @@
 ### 依赖库
 
 ```text
-libtorrent-rasterbar >= 2.0.9
+libtorrent-rasterbar >= 2.0.14（2.1 系列要求 >= 2.1.1，不支持 2.1.0）
 SQLite3
 Python 3（仅运行集成测试时需要）
 ```
+
+最低版本要求用于规避 [libtorrent #8692](https://github.com/arvidn/libtorrent/issues/8692)：
+尚未取得元数据的 v1 任务可能因 peer 声明支持 v2 而进入错误的哈希树处理路径，
+在 `merkle_tree::verified_leafs()` 中触发空指针段错误。上游在 2.0.14 和 2.1.1
+修复了该问题；CMake 的 CONFIG 和 pkg-config 查找路径均执行版本检查。
+升级后应重新配置、编译，并确认运行时实际加载的是已修复的动态库，而非旧版本。
 
 ### 编译
 

@@ -20,9 +20,10 @@ endif()
 
 find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
-# 2.0.9 is the first release that validates v2 piece layers (see
-# CRASH_AND_CONCURRENCY.md) and provides write_torrent_file_buf().
-find_package(LibtorrentRasterbar 2.0.9 CONFIG QUIET)
+# 2.0.14 fixes a null dereference when a v1-only magnet's peer claims v2 support.
+# The same fix requires 2.1.1 on the 2.1 branch; reject 2.1.0 below.
+# https://github.com/arvidn/libtorrent/issues/8692
+find_package(LibtorrentRasterbar 2.0.14 CONFIG QUIET)
 
 if(TARGET SQLite3::SQLite3)
     set(SQLITE_TARGET SQLite3::SQLite3)
@@ -38,9 +39,16 @@ else()
         LibtorrentRasterbar
         REQUIRED
         IMPORTED_TARGET
-        "libtorrent-rasterbar>=2.0.9"
+        "libtorrent-rasterbar>=2.0.14"
     )
     set(LIBTORRENT_TARGET PkgConfig::LibtorrentRasterbar)
+endif()
+
+if(LibtorrentRasterbar_VERSION VERSION_GREATER_EQUAL "2.1.0"
+    AND LibtorrentRasterbar_VERSION VERSION_LESS "2.1.1")
+    message(FATAL_ERROR
+        "libtorrent 2.1.0 is affected by issue #8692; use 2.0.14+ in the 2.0 series or 2.1.1+."
+    )
 endif()
 
 # Portable runtime: sockets, signals, files, console output, logging.
