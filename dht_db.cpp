@@ -1,20 +1,25 @@
+#include "crawler_storage.hpp"
+#include "hash_registry.hpp"
+#include "logger.hpp"
+#include "platform.hpp"
 #include "simple_network.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
-#include <csignal>
 #include <cstdint>
-#include <deque>
+#include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
-#include <future>
-#include <iostream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -28,15 +33,18 @@
 #include <libtorrent/address.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/bdecode.hpp>
-#include <libtorrent/create_torrent.hpp>
-#include <libtorrent/entry.hpp>
-#include <libtorrent/hex.hpp>
 #include <libtorrent/session.hpp>
 #include <libtorrent/session_params.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/sha1_hash.hpp>
 #include <libtorrent/torrent_info.hpp>
-#include <sqlite3.h>
+#include <libtorrent/torrent_status.hpp>
+#include <libtorrent/version.hpp>
+#include <libtorrent/write_resume_data.hpp>
+
+#if LIBTORRENT_VERSION_NUM < 20009
+#error "libtorrent-rasterbar 2.0.9 or newer is required"
+#endif
 
 namespace fs = std::filesystem;
 namespace lt = libtorrent;
@@ -44,38 +52,53 @@ namespace lt = libtorrent;
 namespace
 {
 
+using Clock = std::chrono::steady_clock;
+using InfoHash = HashRegistry::InfoHash;
+
 constexpr int kMinListeners = 1;
 constexpr int kMaxListeners = 64;
 constexpr int kMaxPort = 65535;
-constexpr std::size_t kDatabaseBatchSize = 64;
-constexpr auto kDatabaseBatchDelay = std::chrono::milliseconds(100);
-constexpr auto kAlertWait = std::chrono::milliseconds(250);
+constexpr std::size_t kMaxBindAddresses = 16;
+constexpr std::size_t kMaxActiveLimit = 100000;
+constexpr std::size_t kMaxDedupCacheSize = 100000000;
+constexpr auto kMaxDuration = std::chrono::hours(24 * 365);
+constexpr auto kMaxStagger = std::chrono::milliseconds(10000);
+constexpr auto kMaxIdleWait = std::chrono::milliseconds(250);
 constexpr auto kStatsInterval = std::chrono::seconds(60);
+constexpr auto kReconcileInterval = std::chrono::seconds(30);
+constexpr auto kAlertDropLogInterval = std::chrono::seconds(60);
 constexpr auto kCompletedCacheLifetime = std::chrono::minutes(10);
-constexpr std::size_t kTrackerRpcWorkers = 4;
+constexpr std::size_t kTrackerRpcWorkers = 8;
 constexpr std::size_t kTrackerRpcQueueSize = 128;
+constexpr std::size_t kTrackerRpcRequestSize = 256;
 constexpr std::size_t kMaxTrackerPeers = 512;
-
-volatile std::sig_atomic_t g_stop_requested = 0;
-
-void handle_signal(int)
-{
-    g_stop_requested = 1;
-}
+// libtorrent's default (2000) overflows within seconds under dht_pkt_alert
+// bursts; metadata_received_alert has the same (normal) priority.
+constexpr int kAlertQueueSize = 10000;
+// The limits libtorrent itself applies to incoming DHT messages.
+constexpr int kDhtPacketDepthLimit = 10;
+constexpr int kDhtPacketTokenLimit = 500;
 
 struct Config
 {
-    std::string bind_address = "0.0.0.0";
+    // Every session listens on all of these addresses (same port), so
+    // {"0.0.0.0", "::"} runs an IPv4 and an IPv6 DHT node in each session.
+    std::vector<std::string> bind_addresses = {"0.0.0.0"};
     int listeners = 1;
     int first_port = 6881;
     std::size_t max_active = 200;
+    // 0 means listeners * max_active.
+    std::size_t max_active_total = 0;
     std::chrono::seconds metadata_timeout{30};
     std::chrono::seconds retry_delay{60};
+    std::size_t dedup_cache_size = 262144;
     fs::path database_path = "dht_crawler.db";
     fs::path temp_dir = "tmp";
     fs::path torrent_dir = "torrents";
     fs::path dht_state_dir = "dht_state";
     bool reinitialize_dht = false;
+    std::chrono::seconds dht_save_interval{900};
+    std::chrono::milliseconds bootstrap_stagger{200};
     std::string tracker_rpc_bind = "127.0.0.1";
     int tracker_rpc_port = 19091;
     std::chrono::seconds tracker_lookup_timeout{8};
@@ -104,74 +127,122 @@ bool parse_integer(std::string_view text, Integer &value)
     return true;
 }
 
+// Rejects values whose deadline arithmetic would overflow steady_clock.
 bool parse_positive_seconds(std::string_view text, std::chrono::seconds &value)
 {
     long long seconds = 0;
-    if (!parse_integer(text, seconds) || seconds <= 0)
+    if (!parse_integer(text, seconds)
+        || seconds <= 0
+        || seconds > std::chrono::duration_cast<std::chrono::seconds>(kMaxDuration).count())
+    {
         return false;
+    }
     value = std::chrono::seconds(seconds);
     return true;
 }
 
-void print_usage(const char *program)
+// Appends the entries of a comma-separated bind list ("0.0.0.0,::"); IPv6
+// entries may be bracketed ("[::]"). False on an empty entry.
+bool append_bind_addresses(std::string_view text, std::vector<std::string> &addresses)
 {
-    std::cerr
+    std::size_t offset = 0;
+    while (true)
+    {
+        const std::size_t comma = text.find(',', offset);
+        std::string_view item = text.substr(
+            offset,
+            comma == std::string_view::npos ? std::string_view::npos : comma - offset);
+        while (!item.empty() && item.front() == ' ')
+            item.remove_prefix(1);
+        while (!item.empty() && item.back() == ' ')
+            item.remove_suffix(1);
+        if (item.size() >= 2 && item.front() == '[' && item.back() == ']')
+            item = item.substr(1, item.size() - 2);
+        if (item.empty())
+            return false;
+        addresses.emplace_back(item);
+
+        if (comma == std::string_view::npos)
+            return true;
+        offset = comma + 1;
+    }
+}
+
+void print_usage(const std::string &program)
+{
+    logging::error()
         << "用法:\n"
         << "  " << program << " [bind_addr] [listeners]\n"
         << "  " << program << " [选项]\n\n"
         << "选项:\n"
-        << "  --bind ADDRESS             绑定地址，默认 0.0.0.0\n"
+        << "  --bind ADDRESS[,ADDRESS]   绑定地址，默认 0.0.0.0；可用逗号分隔或重复指定，\n"
+        << "                             例如 0.0.0.0,:: 同时监听 IPv4 和 IPv6\n"
         << "  --listeners N              监听端口数量，范围 1-64\n"
         << "  --first-port PORT          起始端口，默认 6881\n"
-        << "  --max-active N             最大并发元数据任务数，默认 200\n"
+        << "  --max-active N             每个会话最大并发元数据任务数，默认 200\n"
+        << "  --max-active-total N       全进程最大并发元数据任务数，默认 listeners*max-active\n"
         << "  --metadata-timeout SEC     元数据获取超时，默认 30 秒\n"
         << "  --retry-delay SEC          失败重试间隔，默认 60 秒\n"
+        << "  --dedup-cache-size N       去重缓存最大条目数，默认 262144\n"
         << "  --database PATH            SQLite 数据库路径\n"
         << "  --temp-dir PATH            libtorrent 临时目录\n"
         << "  --torrent-dir PATH         torrent 文件目录\n"
         << "  --dht-state-dir PATH       DHT 状态目录，默认 dht_state\n"
+        << "  --dht-save-interval SEC    定期保存 DHT 状态的间隔，默认 900 秒\n"
+        << "  --bootstrap-stagger-ms MS  相邻会话启动间隔，默认 200 毫秒\n"
         << "  --reinitialize-dht         忽略已有状态并重新初始化 DHT\n"
         << "  --tracker-rpc-bind ADDRESS tracker RPC 地址，默认 127.0.0.1\n"
         << "  --tracker-rpc-port PORT    tracker RPC 端口，默认 19091\n"
         << "  --tracker-timeout SEC      DHT 查询超时，默认 8 秒\n"
         << "  --disable-tracker-rpc      禁用 tracker RPC 服务\n"
         << "  --bootstrap-nodes NODES    DHT bootstrap 节点列表\n"
-        << "  --help                     显示帮助\n";
+        << "  --help                     显示帮助";
 }
 
-std::optional<Config> parse_arguments(int argc, char *argv[])
+std::optional<Config> parse_arguments(const std::vector<std::string> &arguments)
 {
     Config config;
+    bool bind_given = false;
 
-    if (argc > 1 && argv[1][0] != '-')
+    if (arguments.size() > 1 && (arguments[1].empty() || arguments[1][0] != '-'))
     {
-        if (argc > 3)
+        if (arguments.size() > 3)
             return std::nullopt;
-        config.bind_address = argv[1];
-        if (argc == 3 && !parse_integer(std::string_view(argv[2]), config.listeners))
+        config.bind_addresses.clear();
+        if (!append_bind_addresses(arguments[1], config.bind_addresses))
+            return std::nullopt;
+        if (arguments.size() == 3 && !parse_integer(std::string_view(arguments[2]), config.listeners))
             return std::nullopt;
     }
     else
     {
-        for (int i = 1; i < argc; ++i)
+        for (std::size_t i = 1; i < arguments.size(); ++i)
         {
-            const std::string_view option(argv[i]);
-            if (option == "--reinitialize-dht"
-                || option == "--disable-tracker-rpc")
+            const std::string_view option(arguments[i]);
+            if (option == "--reinitialize-dht")
             {
-                if (option == "--reinitialize-dht")
-                    config.reinitialize_dht = true;
-                else
-                    config.tracker_rpc_enabled = false;
+                config.reinitialize_dht = true;
+                continue;
+            }
+            if (option == "--disable-tracker-rpc")
+            {
+                config.tracker_rpc_enabled = false;
                 continue;
             }
 
-            if (i + 1 >= argc)
+            if (i + 1 >= arguments.size())
                 return std::nullopt;
 
-            const std::string_view value(argv[++i]);
+            const std::string_view value(arguments[++i]);
             if (option == "--bind")
-                config.bind_address = value;
+            {
+                // The first --bind replaces the default; repeats add to it.
+                if (!bind_given)
+                    config.bind_addresses.clear();
+                bind_given = true;
+                if (!append_bind_addresses(value, config.bind_addresses))
+                    return std::nullopt;
+            }
             else if (option == "--listeners")
             {
                 if (!parse_integer(value, config.listeners))
@@ -187,6 +258,11 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
                 if (!parse_integer(value, config.max_active))
                     return std::nullopt;
             }
+            else if (option == "--max-active-total")
+            {
+                if (!parse_integer(value, config.max_active_total))
+                    return std::nullopt;
+            }
             else if (option == "--metadata-timeout")
             {
                 if (!parse_positive_seconds(value, config.metadata_timeout))
@@ -197,14 +273,35 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
                 if (!parse_positive_seconds(value, config.retry_delay))
                     return std::nullopt;
             }
+            else if (option == "--dedup-cache-size")
+            {
+                if (!parse_integer(value, config.dedup_cache_size))
+                    return std::nullopt;
+            }
             else if (option == "--database")
-                config.database_path = value;
+                config.database_path = platform::path_from_utf8(value);
             else if (option == "--temp-dir")
-                config.temp_dir = value;
+                config.temp_dir = platform::path_from_utf8(value);
             else if (option == "--torrent-dir")
-                config.torrent_dir = value;
+                config.torrent_dir = platform::path_from_utf8(value);
             else if (option == "--dht-state-dir")
-                config.dht_state_dir = value;
+                config.dht_state_dir = platform::path_from_utf8(value);
+            else if (option == "--dht-save-interval")
+            {
+                if (!parse_positive_seconds(value, config.dht_save_interval))
+                    return std::nullopt;
+            }
+            else if (option == "--bootstrap-stagger-ms")
+            {
+                long long milliseconds = -1;
+                if (!parse_integer(value, milliseconds)
+                    || milliseconds < 0
+                    || milliseconds > kMaxStagger.count())
+                {
+                    return std::nullopt;
+                }
+                config.bootstrap_stagger = std::chrono::milliseconds(milliseconds);
+            }
             else if (option == "--tracker-rpc-bind")
                 config.tracker_rpc_bind = value;
             else if (option == "--tracker-rpc-port")
@@ -224,13 +321,18 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
         }
     }
 
-    if (config.bind_address.empty()
+    if (config.bind_addresses.empty()
+        || config.bind_addresses.size() > kMaxBindAddresses
         || config.listeners < kMinListeners
         || config.listeners > kMaxListeners
         || config.first_port <= 0
         || config.first_port > kMaxPort
         || config.listeners - 1 > kMaxPort - config.first_port
         || config.max_active == 0
+        || config.max_active > kMaxActiveLimit
+        || config.max_active_total > kMaxActiveLimit * kMaxListeners
+        || config.dedup_cache_size == 0
+        || config.dedup_cache_size > kMaxDedupCacheSize
         || config.database_path.empty()
         || config.temp_dir.empty()
         || config.torrent_dir.empty()
@@ -245,29 +347,47 @@ std::optional<Config> parse_arguments(int argc, char *argv[])
     }
 
     lt::error_code error;
-    lt::make_address(config.bind_address, error);
-    if (error)
+    std::vector<lt::address> parsed_addresses;
+    for (const std::string &address : config.bind_addresses)
     {
-        std::cerr << "无效绑定地址: " << config.bind_address
-                  << " (" << error.message() << ")\n";
-        return std::nullopt;
+        const lt::address parsed = lt::make_address(address, error);
+        if (error)
+        {
+            logging::error() << "无效绑定地址: " << address
+                             << " (" << error.message() << ")";
+            return std::nullopt;
+        }
+        if (std::find(parsed_addresses.begin(), parsed_addresses.end(), parsed)
+            != parsed_addresses.end())
+        {
+            logging::error() << "重复的绑定地址: " << address;
+            return std::nullopt;
+        }
+        parsed_addresses.push_back(parsed);
     }
 
     lt::make_address(config.tracker_rpc_bind, error);
     if (error)
     {
-        std::cerr << "无效 tracker RPC 绑定地址: "
-                  << config.tracker_rpc_bind
-                  << " (" << error.message() << ")\n";
+        logging::error() << "无效 tracker RPC 绑定地址: "
+                         << config.tracker_rpc_bind
+                         << " (" << error.message() << ")";
         return std::nullopt;
     }
 
     return config;
 }
 
-std::string hash_to_hex(const lt::sha1_hash &hash)
+InfoHash to_key(const lt::sha1_hash &hash)
 {
-    return lt::aux::to_hex(hash.to_string());
+    InfoHash key{};
+    std::memcpy(key.data(), hash.data(), key.size());
+    return key;
+}
+
+lt::sha1_hash from_key(const InfoHash &key)
+{
+    return lt::sha1_hash(reinterpret_cast<const char *>(key.data()));
 }
 
 int hex_value(char character)
@@ -298,380 +418,125 @@ std::optional<lt::sha1_hash> hash_from_hex(std::string_view text)
     return hash;
 }
 
+// Same text on every platform (asio defers to the OS formatter, whose IPv6
+// output and scope-id suffixes differ between Windows and glibc).
+std::string format_address(const lt::address &address)
+{
+    if (address.is_v4())
+    {
+        const auto bytes = address.to_v4().to_bytes();
+        std::array<std::uint8_t, 4> octets{};
+        std::copy(bytes.begin(), bytes.end(), octets.begin());
+        return simple_net::format_ipv4(octets);
+    }
+    const auto bytes = address.to_v6().to_bytes();
+    std::array<std::uint8_t, 16> octets{};
+    std::copy(bytes.begin(), bytes.end(), octets.begin());
+    return simple_net::format_ipv6(octets);
+}
+
 std::string format_endpoint(const lt::tcp::endpoint &endpoint)
 {
-    const std::string address = endpoint.address().to_string();
+    const std::string address = format_address(endpoint.address());
     if (endpoint.address().is_v6())
         return "[" + address + "]:" + std::to_string(endpoint.port());
     return address + ":" + std::to_string(endpoint.port());
 }
 
+// libtorrent listen_interfaces for one session: every bind address on the
+// session's port. libtorrent opens IPv6 sockets as IPv6-only, so "0.0.0.0"
+// and "::" can share a port, and it runs one DHT node per listen socket.
+std::string build_listen_interface(const Config &config, int session_id)
+{
+    const std::string port = std::to_string(config.first_port + session_id);
+    std::string interfaces;
+    for (const std::string &address : config.bind_addresses)
+    {
+        if (!interfaces.empty())
+            interfaces += ',';
+        // Validated addresses: only IPv6 ones contain ':'.
+        if (address.find(':') != std::string::npos)
+            interfaces += '[' + address + ']';
+        else
+            interfaces += address;
+        interfaces += ':' + port;
+    }
+    return interfaces;
+}
+
 std::string build_listen_interfaces(const Config &config)
 {
-    const bool ipv6 = config.bind_address.find(':') != std::string::npos;
     std::string interfaces;
     for (int i = 0; i < config.listeners; ++i)
     {
         if (!interfaces.empty())
             interfaces += ',';
-        if (ipv6)
-            interfaces += '[' + config.bind_address + ']';
-        else
-            interfaces += config.bind_address;
-        interfaces += ':' + std::to_string(config.first_port + i);
+        interfaces += build_listen_interface(config, i);
     }
     return interfaces;
 }
 
-std::string build_listen_interface(const Config &config, int session_id)
+struct KeyHasher
 {
-    const bool ipv6 = config.bind_address.find(':') != std::string::npos;
-    std::string interface;
-    if (ipv6)
-        interface += '[' + config.bind_address + ']';
-    else
-        interface += config.bind_address;
-    interface += ':' + std::to_string(config.first_port + session_id);
-    return interface;
-}
-
-class Statement
-{
-public:
-    Statement() = default;
-
-    Statement(sqlite3 *database, const char *sql)
+    std::size_t operator()(const InfoHash &key) const noexcept
     {
-        const int result = sqlite3_prepare_v2(database, sql, -1, &statement_, nullptr);
-        if (result != SQLITE_OK)
-            throw std::runtime_error(sqlite3_errmsg(database));
+        std::size_t value = 0;
+        std::memcpy(&value, key.data(), sizeof(value));
+        return value;
     }
-
-    ~Statement()
-    {
-        if (statement_)
-            sqlite3_finalize(statement_);
-    }
-
-    Statement(const Statement &) = delete;
-    Statement &operator=(const Statement &) = delete;
-
-    Statement(Statement &&other) noexcept
-        : statement_(std::exchange(other.statement_, nullptr))
-    {
-    }
-
-    Statement &operator=(Statement &&other) noexcept
-    {
-        if (this == &other)
-            return *this;
-        if (statement_)
-            sqlite3_finalize(statement_);
-        statement_ = std::exchange(other.statement_, nullptr);
-        return *this;
-    }
-
-    sqlite3_stmt *get() const
-    {
-        return statement_;
-    }
-
-    void reset()
-    {
-        sqlite3_reset(statement_);
-        sqlite3_clear_bindings(statement_);
-    }
-
-private:
-    sqlite3_stmt *statement_ = nullptr;
 };
 
-class DatabaseConnection
+template <typename Key>
+struct DeadlineEntry
 {
-public:
-    explicit DatabaseConnection(const fs::path &path)
-    {
-        const std::string filename = path.string();
-        const int result = sqlite3_open_v2(
-            filename.c_str(),
-            &database_,
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-            nullptr);
-        if (result != SQLITE_OK)
-        {
-            const std::string message =
-                database_ ? sqlite3_errmsg(database_) : "无法分配 SQLite handle";
-            if (database_)
-                sqlite3_close(database_);
-            database_ = nullptr;
-            throw std::runtime_error("数据库打开失败: " + message);
-        }
-
-        sqlite3_busy_timeout(database_, 5000);
-    }
-
-    ~DatabaseConnection()
-    {
-        if (database_)
-            sqlite3_close(database_);
-    }
-
-    DatabaseConnection(const DatabaseConnection &) = delete;
-    DatabaseConnection &operator=(const DatabaseConnection &) = delete;
-
-    sqlite3 *get() const
-    {
-        return database_;
-    }
-
-    void execute(const char *sql)
-    {
-        char *error_message = nullptr;
-        const int result = sqlite3_exec(database_, sql, nullptr, nullptr, &error_message);
-        if (result == SQLITE_OK)
-            return;
-
-        const std::string message =
-            error_message ? error_message : sqlite3_errmsg(database_);
-        sqlite3_free(error_message);
-        throw std::runtime_error(message);
-    }
-
-private:
-    sqlite3 *database_ = nullptr;
+    Clock::time_point deadline;
+    Key key;
 };
 
-struct TorrentRecord
+template <typename Key>
+struct LaterDeadlineFirst
 {
-    std::string hash;
-    std::string name;
-    std::string peer;
+    bool operator()(const DeadlineEntry<Key> &left, const DeadlineEntry<Key> &right) const
+    {
+        return left.deadline > right.deadline;
+    }
 };
 
-struct DatabaseRequest
+template <typename Key>
+using DeadlineQueue = std::priority_queue<
+    DeadlineEntry<Key>,
+    std::vector<DeadlineEntry<Key>>,
+    LaterDeadlineFirst<Key>>;
+
+struct LookupOutcome
 {
-    TorrentRecord record;
-    std::promise<bool> result;
+    InfoHash hash;
+    storage::LookupResult result;
 };
 
-class DatabaseManager
+// Wakes a session thread when libtorrent has alerts or the database reader
+// has answered one of its lookups. Owned by CrawlerApp for the whole run so
+// storage callbacks never race session construction.
+struct Mailbox
 {
-public:
-    explicit DatabaseManager(const fs::path &path)
-        : path_(path),
-          reader_(path)
-    {
-        reader_.execute("PRAGMA journal_mode=WAL;");
-        reader_.execute(
-            "CREATE TABLE IF NOT EXISTS torrents ("
-            "info_hash TEXT PRIMARY KEY NOT NULL,"
-            "name TEXT NOT NULL,"
-            "discovered_peer TEXT NOT NULL,"
-            "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP"
-            ");");
-        contains_statement_ = Statement(
-            reader_.get(),
-            "SELECT 1 FROM torrents WHERE info_hash = ? LIMIT 1;");
-        writer_thread_ = std::thread(&DatabaseManager::writer_loop, this);
-    }
-
-    ~DatabaseManager()
-    {
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            stopping_ = true;
-        }
-        queue_condition_.notify_all();
-        if (writer_thread_.joinable())
-            writer_thread_.join();
-    }
-
-    DatabaseManager(const DatabaseManager &) = delete;
-    DatabaseManager &operator=(const DatabaseManager &) = delete;
-
-    bool contains(const std::string &hash)
-    {
-        sqlite3_stmt *statement = contains_statement_.get();
-        contains_statement_.reset();
-        if (sqlite3_bind_text(statement, 1, hash.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK)
-            throw std::runtime_error(sqlite3_errmsg(reader_.get()));
-
-        const int result = sqlite3_step(statement);
-        if (result == SQLITE_ROW)
-            return true;
-        if (result == SQLITE_DONE)
-            return false;
-        throw std::runtime_error(sqlite3_errmsg(reader_.get()));
-    }
-
-    std::future<bool> enqueue(TorrentRecord record)
-    {
-        DatabaseRequest request{std::move(record), {}};
-        std::future<bool> result = request.result.get_future();
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (stopping_)
-            {
-                request.result.set_value(false);
-                return result;
-            }
-            queue_.push_back(std::move(request));
-        }
-        queue_condition_.notify_one();
-        return result;
-    }
-
-private:
-    static bool execute_batch(
-        DatabaseConnection &connection,
-        Statement &insert_statement,
-        std::vector<DatabaseRequest> &batch)
-    {
-        std::string last_error;
-        for (int attempt = 0; attempt < 3; ++attempt)
-        {
-            bool success = true;
-            try
-            {
-                connection.execute("BEGIN IMMEDIATE;");
-                for (DatabaseRequest &request : batch)
-                {
-                    sqlite3_stmt *statement = insert_statement.get();
-                    insert_statement.reset();
-                    const TorrentRecord &record = request.record;
-
-                    if (sqlite3_bind_text(statement, 1, record.hash.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK
-                        || sqlite3_bind_text(statement, 2, record.name.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK
-                        || sqlite3_bind_text(statement, 3, record.peer.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK
-                        || sqlite3_step(statement) != SQLITE_DONE)
-                    {
-                        last_error = sqlite3_errmsg(connection.get());
-                        success = false;
-                        break;
-                    }
-                }
-
-                if (success)
-                {
-                    connection.execute("COMMIT;");
-                    return true;
-                }
-                connection.execute("ROLLBACK;");
-            }
-            catch (const std::exception &error)
-            {
-                last_error = error.what();
-                try
-                {
-                    connection.execute("ROLLBACK;");
-                }
-                catch (const std::exception &)
-                {
-                }
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50 * (attempt + 1)));
-        }
-        std::cerr << "[DB] 批量写入失败: "
-                  << (last_error.empty() ? "未知 SQLite 错误" : last_error) << '\n';
-        return false;
-    }
-
-    void writer_loop()
-    {
-        try
-        {
-            DatabaseConnection writer(path_);
-            Statement insert_statement(
-                writer.get(),
-                "INSERT OR IGNORE INTO torrents "
-                "(info_hash, name, discovered_peer) VALUES (?, ?, ?);");
-
-            while (true)
-            {
-                std::vector<DatabaseRequest> batch;
-                {
-                    std::unique_lock<std::mutex> lock(queue_mutex_);
-                    queue_condition_.wait(lock, [this] {
-                        return stopping_ || !queue_.empty();
-                    });
-                    if (stopping_ && queue_.empty())
-                        break;
-
-                    queue_condition_.wait_for(lock, kDatabaseBatchDelay, [this] {
-                        return stopping_ || queue_.size() >= kDatabaseBatchSize;
-                    });
-
-                    const std::size_t count =
-                        std::min(queue_.size(), kDatabaseBatchSize);
-                    batch.reserve(count);
-                    for (std::size_t i = 0; i < count; ++i)
-                    {
-                        batch.push_back(std::move(queue_.front()));
-                        queue_.pop_front();
-                    }
-                }
-
-                const bool success = execute_batch(writer, insert_statement, batch);
-                for (DatabaseRequest &request : batch)
-                    request.result.set_value(success);
-            }
-        }
-        catch (const std::exception &error)
-        {
-            std::cerr << "[DB] 写线程异常退出: " << error.what() << '\n';
-            fail_pending_requests();
-        }
-    }
-
-    void fail_pending_requests()
-    {
-        std::deque<DatabaseRequest> pending;
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            stopping_ = true;
-            pending.swap(queue_);
-        }
-        for (DatabaseRequest &request : pending)
-            request.result.set_value(false);
-    }
-
-    fs::path path_;
-    DatabaseConnection reader_;
-    Statement contains_statement_;
-    std::mutex queue_mutex_;
-    std::condition_variable queue_condition_;
-    std::deque<DatabaseRequest> queue_;
-    bool stopping_ = false;
-    std::thread writer_thread_;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool alerts_ready = false;
+    std::vector<LookupOutcome> outcomes;
 };
 
-enum class HashStatus
+struct PendingAdd
 {
-    active,
-    persisting,
-    completed,
-    failed
-};
-
-struct HashState
-{
-    HashStatus status = HashStatus::active;
-    std::chrono::steady_clock::time_point retry_after{};
+    lt::tcp::endpoint peer;
+    Clock::time_point deadline;
 };
 
 struct ActiveTask
 {
-    lt::sha1_hash hash;
+    InfoHash key;
     std::string hash_hex;
     lt::tcp::endpoint peer;
-    std::chrono::steady_clock::time_point deadline;
-};
-
-struct PendingWrite
-{
-    lt::sha1_hash hash;
-    std::string hash_hex;
-    std::future<bool> result;
+    Clock::time_point deadline;
 };
 
 class CrawlerApp
@@ -679,50 +544,74 @@ class CrawlerApp
 public:
     explicit CrawlerApp(Config config)
         : config_(prepare_config(std::move(config))),
-          database_(config_.database_path)
+          temp_dir_utf8_(platform::path_to_utf8(config_.temp_dir)),
+          registry_(config_.dedup_cache_size),
+          max_total_(
+              config_.max_active_total != 0
+                  ? config_.max_active_total
+                  : config_.max_active * static_cast<std::size_t>(config_.listeners))
     {
-        sessions_.reserve(static_cast<std::size_t>(config_.listeners));
+        mailboxes_.reserve(static_cast<std::size_t>(config_.listeners));
         for (int id = 0; id < config_.listeners; ++id)
-            sessions_.push_back(std::make_unique<SessionContext>(id, create_session(config_, id)));
-        session_threads_.reserve(sessions_.size());
+            mailboxes_.push_back(std::make_unique<Mailbox>());
+
+        storage::Options options;
+        options.database_path = config_.database_path;
+        options.torrent_dir = config_.torrent_dir;
+        storage_ = std::make_unique<storage::Storage>(
+            options,
+            [this](int tag, const InfoHash &hash, storage::LookupResult result) {
+                on_lookup_result(tag, hash, result);
+            },
+            [this](const storage::PersistJob &job, bool persisted) {
+                on_persisted(job, persisted);
+            });
     }
+
+    ~CrawlerApp()
+    {
+        try
+        {
+            shutdown();
+        }
+        catch (...)
+        {
+        }
+    }
+
+    CrawlerApp(const CrawlerApp &) = delete;
+    CrawlerApp &operator=(const CrawlerApp &) = delete;
 
     int run()
     {
-        std::cout << "DHT 爬虫已启动，监听 " << build_listen_interfaces(config_)
-                  << "，最大活动任务 " << config_.max_active << '\n';
+        logging::info() << "DHT 爬虫已启动，监听 " << build_listen_interfaces(config_)
+                        << "，最大活动任务 " << config_.max_active
+                        << "（全进程 " << max_total_ << "）";
 
-        for (auto &context : sessions_)
-            session_threads_.emplace_back(&CrawlerApp::run_session, this, context.get());
+        start_sessions();
+        if (!platform::shutdown_requested())
+            start_tracker_rpc();
 
-        start_tracker_rpc();
-
-        while (!g_stop_requested)
+        auto next_save = Clock::now() + config_.dht_save_interval;
+        auto next_stats = Clock::now() + kStatsInterval;
+        while (!platform::wait_for_shutdown(std::chrono::seconds(1)))
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const auto now = Clock::now();
+            if (now >= next_save)
+            {
+                save_dht_states();
+                next_save = now + config_.dht_save_interval;
+            }
+            if (now >= next_stats)
+            {
+                log_global_stats();
+                next_stats = now + kStatsInterval;
+            }
         }
 
-        std::cout << "收到退出信号，正在停止会话...\n";
-        lookup_stopping_.store(true);
-        cancel_pending_lookups("DHT 爬虫正在退出");
-        tracker_rpc_server_.stop();
-
-        for (std::thread &thread : session_threads_)
-        {
-            if (thread.joinable())
-                thread.join();
-        }
-
-        const bool state_saved = save_dht_states();
-
-        std::cout << "正在清理任务...\n";
-        for (auto &context : sessions_)
-        {
-            for (const auto &item : context->active_tasks)
-                remove_torrent(*context, item.first);
-            context->active_tasks.clear();
-        }
-        return state_saved ? 0 : 1;
+        logging::info() << "收到退出信号 (" << platform::shutdown_reason()
+                        << ")，正在停止会话...";
+        return shutdown();
     }
 
 private:
@@ -754,19 +643,38 @@ private:
 
     struct SessionContext
     {
-        SessionContext(int session_id, lt::session session_instance)
+        SessionContext(int session_id, Mailbox &session_mailbox, lt::session session_instance)
             : id(session_id),
+              mailbox(session_mailbox),
               session(std::move(session_instance))
         {
         }
 
+        std::size_t slots_used() const
+        {
+            return checking.size() + adding.size() + active_tasks.size();
+        }
+
         int id = 0;
+        Mailbox &mailbox;
         lt::session session;
-        std::unordered_map<lt::sha1_hash, HashState> hash_states;
+        // Reused for every DHT packet to avoid a token allocation per packet.
+        lt::bdecode_node packet;
+        // Hashes waiting for the database lookup, keyed to the announcing peer.
+        std::unordered_map<InfoHash, lt::tcp::endpoint, KeyHasher> checking;
+        // async_add_torrent issued, add_torrent_alert not yet seen.
+        std::unordered_map<InfoHash, PendingAdd, KeyHasher> adding;
         TaskMap active_tasks;
-        std::vector<PendingWrite> pending_writes;
+        DeadlineQueue<InfoHash> add_deadlines;
+        DeadlineQueue<lt::torrent_handle> task_deadlines;
+        bool reconcile_requested = false;
+        Clock::time_point last_drop_log{};
         std::uint64_t requests = 0;
         std::uint64_t responses = 0;
+        std::uint64_t dropped_busy = 0;
+        std::uint64_t alert_drops = 0;
+        std::uint64_t orphans_removed = 0;
+        std::uint64_t metadata_recovered = 0;
     };
 
     static Config prepare_config(Config config)
@@ -778,7 +686,7 @@ private:
             {
                 throw std::runtime_error(
                     std::string("创建") + label + "失败: "
-                    + path.string() + ": " + error.message());
+                    + platform::path_to_utf8(path) + ": " + error.message());
             }
         };
 
@@ -787,6 +695,12 @@ private:
         create_directory(config.dht_state_dir, " DHT 状态目录");
         if (config.database_path.has_parent_path())
             create_directory(config.database_path.parent_path(), "数据库目录");
+
+        const std::size_t stale =
+            platform::remove_stale_temp_files(config.torrent_dir)
+            + platform::remove_stale_temp_files(config.dht_state_dir);
+        if (stale > 0)
+            logging::info() << "已清理 " << stale << " 个残留临时文件";
         return config;
     }
 
@@ -802,63 +716,24 @@ private:
     {
         std::ifstream input(path, std::ios::binary | std::ios::ate);
         if (!input)
-            throw std::runtime_error("无法打开 DHT 状态文件 " + path.string());
+            throw std::runtime_error("无法打开 DHT 状态文件 " + platform::path_to_utf8(path));
 
         const std::streampos end = input.tellg();
         if (end <= 0)
-            throw std::runtime_error("DHT 状态文件为空 " + path.string());
+            throw std::runtime_error("DHT 状态文件为空 " + platform::path_to_utf8(path));
 
         std::vector<char> buffer(static_cast<std::size_t>(end));
         input.seekg(0, std::ios::beg);
         input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         if (!input)
-            throw std::runtime_error("读取 DHT 状态文件失败 " + path.string());
+            throw std::runtime_error("读取 DHT 状态文件失败 " + platform::path_to_utf8(path));
         return buffer;
     }
 
-    static void write_binary_file_atomic(
-        const fs::path &target_path,
-        const std::vector<char> &buffer)
-    {
-        fs::path temporary_path = target_path;
-        temporary_path += ".tmp";
-
-        {
-            std::ofstream output(
-                temporary_path,
-                std::ios::binary | std::ios::trunc);
-            if (!output)
-            {
-                throw std::runtime_error(
-                    "无法打开 DHT 临时状态文件 " + temporary_path.string());
-            }
-
-            output.write(
-                buffer.data(),
-                static_cast<std::streamsize>(buffer.size()));
-            output.close();
-            if (!output)
-            {
-                std::error_code ignored;
-                fs::remove(temporary_path, ignored);
-                throw std::runtime_error(
-                    "写入 DHT 临时状态文件失败 " + temporary_path.string());
-            }
-        }
-
-        std::error_code error;
-        fs::rename(temporary_path, target_path, error);
-        if (error)
-        {
-            std::error_code ignored;
-            fs::remove(temporary_path, ignored);
-            throw std::runtime_error(
-                "发布 DHT 状态文件失败 " + target_path.string()
-                + ": " + error.message());
-        }
-    }
-
-    static lt::session create_session(const Config &config, int session_id)
+    static lt::session create_session(
+        const Config &config,
+        int session_id,
+        std::vector<lt::sha1_hash> &known_node_ids)
     {
         lt::settings_pack settings;
         settings.set_int(
@@ -867,6 +742,7 @@ private:
                 | lt::alert_category::status
                 | lt::alert_category::error
                 | lt::alert_category::dht_operation);
+        settings.set_int(lt::settings_pack::alert_queue_size, kAlertQueueSize);
         settings.set_bool(lt::settings_pack::enable_dht, true);
         settings.set_bool(lt::settings_pack::enable_lsd, false);
         settings.set_str(
@@ -878,6 +754,7 @@ private:
 
         lt::session_params parameters(std::move(settings));
         const fs::path state_path = dht_state_path(config, session_id);
+        const std::string state_name = platform::path_to_utf8(state_path);
         if (config.reinitialize_dht)
         {
             std::error_code error;
@@ -885,14 +762,12 @@ private:
             if (error)
             {
                 throw std::runtime_error(
-                    "删除旧 DHT 状态失败 " + state_path.string()
-                    + ": " + error.message());
+                    "删除旧 DHT 状态失败 " + state_name + ": " + error.message());
             }
 
-            std::cout << "[Session " << session_id << "][DHT] "
-                      << (removed ? "已删除旧状态并重新初始化"
-                                  : "没有旧状态，正在重新初始化")
-                      << '\n';
+            logging::info() << "[Session " << session_id << "][DHT] "
+                            << (removed ? "已删除旧状态并重新初始化"
+                                        : "没有旧状态，正在重新初始化");
         }
         else
         {
@@ -901,8 +776,7 @@ private:
             if (error)
             {
                 throw std::runtime_error(
-                    "检查 DHT 状态文件失败 " + state_path.string()
-                    + ": " + error.message());
+                    "检查 DHT 状态文件失败 " + state_name + ": " + error.message());
             }
 
             if (state_exists)
@@ -919,20 +793,38 @@ private:
                             "状态中没有可恢复的 DHT 节点 ID");
                     }
 
+                    // A state file copied between sessions would make two
+                    // sessions share a node ID and cover the same keyspace.
+                    const bool duplicate = std::any_of(
+                        restored.dht_state.nids.begin(),
+                        restored.dht_state.nids.end(),
+                        [&](const auto &item) {
+                            return std::find(known_node_ids.begin(), known_node_ids.end(), item.second)
+                                != known_node_ids.end();
+                        });
+                    if (duplicate)
+                    {
+                        logging::error() << "[Session " << session_id
+                                         << "][DHT] 状态中的节点 ID 与其他会话重复，将生成新 ID";
+                        restored.dht_state.nids.clear();
+                    }
+                    for (const auto &item : restored.dht_state.nids)
+                        known_node_ids.push_back(item.second);
+
                     const std::size_t node_ids = restored.dht_state.nids.size();
                     const std::size_t nodes =
                         restored.dht_state.nodes.size()
                         + restored.dht_state.nodes6.size();
                     parameters.dht_state = std::move(restored.dht_state);
-                    std::cout << "[Session " << session_id
-                              << "][DHT] 已加载状态 " << state_path
-                              << "，节点 ID " << node_ids
-                              << "，引导节点 " << nodes << '\n';
+                    logging::info() << "[Session " << session_id
+                                    << "][DHT] 已加载状态 " << state_name
+                                    << "，节点 ID " << node_ids
+                                    << "，引导节点 " << nodes;
                 }
                 catch (const std::exception &error)
                 {
                     throw std::runtime_error(
-                        "加载 DHT 状态失败 " + state_path.string()
+                        "加载 DHT 状态失败 " + state_name
                         + ": " + error.what()
                         + "；如需丢弃旧状态，请使用 --reinitialize-dht");
                 }
@@ -940,6 +832,97 @@ private:
         }
 
         return lt::session(std::move(parameters));
+    }
+
+    void start_sessions()
+    {
+        std::vector<lt::sha1_hash> known_node_ids;
+        sessions_.reserve(static_cast<std::size_t>(config_.listeners));
+        session_threads_.reserve(static_cast<std::size_t>(config_.listeners));
+        for (int id = 0; id < config_.listeners; ++id)
+        {
+            // Staggered start: N sessions bootstrapping in the same instant
+            // from one IP hit the same few routers with a burst they may
+            // rate-limit.
+            if (id > 0
+                && config_.bootstrap_stagger.count() > 0
+                && platform::wait_for_shutdown(config_.bootstrap_stagger))
+            {
+                break;
+            }
+
+            Mailbox *mailbox = mailboxes_[static_cast<std::size_t>(id)].get();
+            sessions_.push_back(std::make_unique<SessionContext>(
+                id, *mailbox, create_session(config_, id, known_node_ids)));
+            SessionContext *context = sessions_.back().get();
+            // Runs on libtorrent's network thread: only flag and notify.
+            context->session.set_alert_notify([mailbox] {
+                {
+                    std::lock_guard<std::mutex> lock(mailbox->mutex);
+                    mailbox->alerts_ready = true;
+                }
+                mailbox->condition.notify_one();
+            });
+            session_threads_.emplace_back(&CrawlerApp::run_session, this, context);
+        }
+    }
+
+    int shutdown()
+    {
+        if (shut_down_)
+            return exit_code_;
+        shut_down_ = true;
+
+        cancel_pending_lookups("DHT 爬虫正在退出");
+        tracker_rpc_server_.stop();
+
+        stopping_.store(true);
+        for (const auto &mailbox : mailboxes_)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mailbox->mutex);
+            }
+            mailbox->condition.notify_all();
+        }
+        for (std::thread &thread : session_threads_)
+        {
+            if (thread.joinable())
+                thread.join();
+        }
+
+        // Flush fetched metadata first: it is the data that cannot be
+        // recovered, and Windows gives a closing console only seconds.
+        storage_->stop();
+        const storage::Stats stats = storage_->stats();
+        logging::info() << "[DB] 已写入 " << stats.persisted
+                        << " 条，失败 " << stats.persist_failures;
+
+        const bool state_saved = save_dht_states();
+
+        logging::info() << "正在清理任务...";
+        for (auto &context : sessions_)
+        {
+            for (const auto &item : context->active_tasks)
+                remove_torrent(*context, item.first);
+            context->active_tasks.clear();
+            context->adding.clear();
+            context->checking.clear();
+        }
+
+        // abort() starts every session's shutdown at once; destroying the
+        // proxies then waits for all of them in parallel instead of one
+        // blocking session destructor after another.
+        std::vector<lt::session_proxy> proxies;
+        proxies.reserve(sessions_.size());
+        for (auto &context : sessions_)
+        {
+            context->session.set_alert_notify({});
+            proxies.push_back(context->session.abort());
+        }
+        proxies.clear();
+
+        exit_code_ = state_saved ? 0 : 1;
+        return exit_code_;
     }
 
     bool save_dht_states()
@@ -962,75 +945,85 @@ private:
                 const std::size_t nodes =
                     parameters.dht_state.nodes.size()
                     + parameters.dht_state.nodes6.size();
-                std::vector<char> buffer = lt::write_session_params_buf(
+                const std::vector<char> buffer = lt::write_session_params_buf(
                     parameters,
                     lt::session_handle::save_dht_state);
-                write_binary_file_atomic(state_path, buffer);
+                platform::write_file_atomic(
+                    state_path,
+                    std::string_view(buffer.data(), buffer.size()),
+                    true);
 
-                std::cout << "[Session " << context->id
-                          << "][DHT] 已保存状态 " << state_path
-                          << "，节点 ID " << node_ids
-                          << "，引导节点 " << nodes << '\n';
+                logging::info() << "[Session " << context->id
+                                << "][DHT] 已保存状态 " << platform::path_to_utf8(state_path)
+                                << "，节点 ID " << node_ids
+                                << "，引导节点 " << nodes;
             }
             catch (const std::exception &error)
             {
                 all_saved = false;
-                std::cerr << "[Session " << context->id
-                          << "][DHT] 保存状态失败: " << error.what() << '\n';
+                logging::error() << "[Session " << context->id
+                                 << "][DHT] 保存状态失败: " << error.what();
             }
         }
         return all_saved;
+    }
+
+    void log_global_stats()
+    {
+        const HashRegistry::Stats registry = registry_.stats();
+        const storage::Stats database = storage_->stats();
+        logging::info() << "[Stats] InFlight: " << registry.in_flight
+                        << " Cached: " << registry.settled
+                        << " Evicted: " << registry.evicted
+                        << " Slots: " << global_used_.load() << '/' << max_total_
+                        << " DBQueue: " << database.queued_jobs
+                        << " Lookups: " << database.queued_lookups
+                        << " Saved: " << database.persisted
+                        << " WAL: " << database.wal_bytes
+                        << " LogDropped: " << logging::dropped();
     }
 
     void start_tracker_rpc()
     {
         if (!config_.tracker_rpc_enabled)
         {
-            std::cout << "[Tracker RPC] 已禁用\n";
+            logging::info() << "[Tracker RPC] 已禁用";
             return;
         }
 
         try
         {
-            tracker_rpc_server_.start(
-                config_.tracker_rpc_bind,
-                static_cast<std::uint16_t>(config_.tracker_rpc_port),
-                kTrackerRpcWorkers,
-                kTrackerRpcQueueSize,
-                [this](int socket, const std::string &remote) {
-                    handle_tracker_rpc(socket, remote);
-                });
-            std::cout << "[Tracker RPC] 监听 "
-                      << config_.tracker_rpc_bind << ':'
-                      << config_.tracker_rpc_port << '\n';
+            simple_net::ServerOptions options;
+            options.bind_address = config_.tracker_rpc_bind;
+            options.port = static_cast<std::uint16_t>(config_.tracker_rpc_port);
+            options.worker_count = kTrackerRpcWorkers;
+            options.max_pending = kTrackerRpcQueueSize;
+            options.delimiter = "\n";
+            options.max_request_size = kTrackerRpcRequestSize;
+            options.request_timeout = rpc_io_budget();
+            tracker_rpc_server_.start(std::move(options), [this](simple_net::Connection &connection) {
+                handle_tracker_rpc(connection);
+            });
+            logging::info() << "[Tracker RPC] 监听 "
+                            << config_.tracker_rpc_bind << ':'
+                            << config_.tracker_rpc_port;
         }
         catch (const std::exception &error)
         {
-            std::cerr << "[Tracker RPC] 启动失败，DHT 爬虫继续运行: "
-                      << error.what() << '\n';
+            logging::error() << "[Tracker RPC] 启动失败，DHT 爬虫继续运行: "
+                             << error.what();
         }
     }
 
-    void handle_tracker_rpc(int socket, const std::string &remote)
+    std::chrono::milliseconds rpc_io_budget() const
     {
-        const int socket_timeout =
-            static_cast<int>(config_.tracker_lookup_timeout.count() * 1000 + 2000);
-        simple_net::set_socket_timeouts(socket, socket_timeout);
+        return config_.tracker_lookup_timeout + std::chrono::seconds(2);
+    }
 
-        std::string request;
-        std::string network_error;
-        if (!simple_net::read_until(
-                socket,
-                request,
-                "\n",
-                256,
-                network_error))
-        {
-            return;
-        }
-
-        const std::size_t newline = request.find('\n');
-        request.resize(newline);
+    void handle_tracker_rpc(simple_net::Connection &connection)
+    {
+        std::string request = connection.request;
+        request.resize(request.find('\n'));
         if (!request.empty() && request.back() == '\r')
             request.pop_back();
 
@@ -1042,22 +1035,24 @@ private:
         parser >> protocol >> command >> hash_text;
         parser >> extra;
         const std::optional<lt::sha1_hash> hash = hash_from_hex(hash_text);
+        std::string network_error;
         if (protocol != "DHTP/1"
             || command != "GET_PEERS"
             || !hash
             || !extra.empty())
         {
-            std::string ignored;
             simple_net::write_all(
-                socket,
+                connection.socket.get(),
                 "DHTP/1 ERROR invalid-request\nEND\n",
-                ignored);
+                simple_net::Clock::now() + rpc_io_budget(),
+                network_error,
+                &tracker_rpc_server_.stopping());
             return;
         }
 
-        std::cout << "[Tracker RPC] " << remote
-                  << " 查询 " << hash_text << '\n';
-        LookupReply reply = lookup_dht_peers(*hash);
+        logging::info() << "[Tracker RPC] " << connection.remote
+                        << " 查询 " << hash_text;
+        const LookupReply reply = lookup_dht_peers(*hash);
 
         std::ostringstream response;
         if (reply.status == LookupStatus::ok)
@@ -1067,7 +1062,7 @@ private:
             {
                 response << "PEER "
                          << (peer.address().is_v6() ? 6 : 4) << ' '
-                         << peer.address().to_string() << ' '
+                         << format_address(peer.address()) << ' '
                          << peer.port() << '\n';
             }
         }
@@ -1081,19 +1076,26 @@ private:
         }
         response << "END\n";
 
-        simple_net::write_all(socket, response.str(), network_error);
+        simple_net::write_all(
+            connection.socket.get(),
+            response.str(),
+            simple_net::Clock::now() + rpc_io_budget(),
+            network_error,
+            &tracker_rpc_server_.stopping());
     }
 
     LookupReply lookup_dht_peers(const lt::sha1_hash &hash)
     {
-        if (lookup_stopping_.load() || sessions_.empty())
-            return {LookupStatus::error, {}, "DHT 查询服务不可用"};
-
         std::shared_ptr<PendingLookup> pending;
         bool start_lookup = false;
         std::size_t session_index = 0;
         {
+            // Checked under the same lock cancel_pending_lookups() takes, so
+            // no lookup can register after shutdown cancelled the rest.
             std::lock_guard<std::mutex> lock(lookup_mutex_);
+            if (lookup_stopping_ || sessions_.empty())
+                return {LookupStatus::error, {}, "DHT 查询服务不可用"};
+
             auto iterator = pending_lookups_.find(hash);
             if (iterator != pending_lookups_.end())
             {
@@ -1191,6 +1193,7 @@ private:
         std::vector<std::shared_ptr<PendingLookup>> pending;
         {
             std::lock_guard<std::mutex> lock(lookup_mutex_);
+            lookup_stopping_ = true;
             pending.reserve(pending_lookups_.size());
             for (auto &item : pending_lookups_)
                 pending.push_back(std::move(item.second));
@@ -1208,46 +1211,158 @@ private:
         }
     }
 
-    void run_session(SessionContext *context)
+    // Called on the storage reader thread.
+    void on_lookup_result(int tag, const InfoHash &hash, storage::LookupResult result)
     {
-        auto next_stats = std::chrono::steady_clock::now() + kStatsInterval;
-        while (!g_stop_requested)
+        if (tag < 0 || static_cast<std::size_t>(tag) >= mailboxes_.size())
+            return;
+        Mailbox &mailbox = *mailboxes_[static_cast<std::size_t>(tag)];
         {
-            context->session.wait_for_alert(kAlertWait);
-            drain_session(*context);
+            std::lock_guard<std::mutex> lock(mailbox.mutex);
+            mailbox.outcomes.push_back(LookupOutcome{hash, result});
+        }
+        mailbox.condition.notify_one();
+    }
 
-            const auto now = std::chrono::steady_clock::now();
-            expire_tasks(*context, now);
-            poll_database_writes(*context, now);
-            expire_hash_states(*context, now);
-
-            if (now >= next_stats)
-            {
-                context->session.post_dht_stats();
-                next_stats = now + kStatsInterval;
-            }
+    // Called on the storage writer thread.
+    void on_persisted(const storage::PersistJob &job, bool persisted)
+    {
+        const auto now = Clock::now();
+        if (persisted)
+        {
+            registry_.settle_completed(job.hash, now + kCompletedCacheLifetime);
+            logging::info() << "[Session " << job.origin
+                            << "][DB] 已保存 " << job.hash_hex;
+        }
+        else
+        {
+            registry_.settle_failed(job.hash, now + config_.retry_delay);
+            logging::error() << "[Session " << job.origin
+                             << "][DB] 保存失败: " << job.hash_hex;
         }
     }
 
-    void drain_session(SessionContext &context)
+    bool reserve_global_slot()
+    {
+        std::size_t current = global_used_.load();
+        do
+        {
+            if (current >= max_total_)
+                return false;
+        } while (!global_used_.compare_exchange_weak(current, current + 1));
+        return true;
+    }
+
+    void release_global_slot()
+    {
+        global_used_.fetch_sub(1);
+    }
+
+    void run_session(SessionContext *context)
+    {
+        try
+        {
+            session_loop(*context);
+        }
+        catch (const std::exception &error)
+        {
+            logging::error() << "[Session " << context->id
+                             << "] 会话线程异常退出: " << error.what();
+        }
+        catch (...)
+        {
+            logging::error() << "[Session " << context->id
+                             << "] 会话线程异常退出: 未知异常";
+        }
+    }
+
+    Clock::time_point next_wake(
+        const SessionContext &context,
+        Clock::time_point next_stats,
+        Clock::time_point next_reconcile) const
+    {
+        Clock::time_point wake = std::min(
+            {Clock::now() + kMaxIdleWait, next_stats, next_reconcile});
+        if (!context.add_deadlines.empty())
+            wake = std::min(wake, context.add_deadlines.top().deadline);
+        if (!context.task_deadlines.empty())
+            wake = std::min(wake, context.task_deadlines.top().deadline);
+        return wake;
+    }
+
+    void wait_for_work(
+        SessionContext &context,
+        std::vector<LookupOutcome> &outcomes,
+        Clock::time_point wake)
+    {
+        Mailbox &mailbox = context.mailbox;
+        std::unique_lock<std::mutex> lock(mailbox.mutex);
+        mailbox.condition.wait_until(lock, wake, [&] {
+            return mailbox.alerts_ready || !mailbox.outcomes.empty() || stopping_.load();
+        });
+        // Cleared before pop_alerts(): an alert posted after the pop raises
+        // the flag again, so no wake-up is lost.
+        mailbox.alerts_ready = false;
+        outcomes.swap(mailbox.outcomes);
+    }
+
+    void session_loop(SessionContext &context)
     {
         std::vector<lt::alert *> alerts;
-        context.session.pop_alerts(&alerts);
-        for (lt::alert *alert : alerts)
+        std::vector<LookupOutcome> outcomes;
+        auto next_stats = Clock::now() + kStatsInterval;
+        auto next_reconcile = Clock::now() + kReconcileInterval;
+        while (!stopping_.load())
         {
+            wait_for_work(context, outcomes, next_wake(context, next_stats, next_reconcile));
+            if (stopping_.load())
+                break;
+
             try
             {
-                handle_alert(context, alert);
+                context.session.pop_alerts(&alerts);
+                for (lt::alert *alert : alerts)
+                {
+                    try
+                    {
+                        handle_alert(context, alert);
+                    }
+                    catch (const std::exception &error)
+                    {
+                        logging::error() << "[Session " << context.id
+                                         << "][Alert] 处理失败: " << error.what();
+                    }
+                    catch (...)
+                    {
+                        logging::error() << "[Session " << context.id
+                                         << "][Alert] 处理失败: 未知异常";
+                    }
+                }
+                alerts.clear();
+
+                const auto now = Clock::now();
+                for (const LookupOutcome &outcome : outcomes)
+                    handle_lookup_outcome(context, outcome, now);
+                outcomes.clear();
+
+                expire_tasks(context, now);
+                if (context.reconcile_requested || now >= next_reconcile)
+                {
+                    context.reconcile_requested = false;
+                    next_reconcile = now + kReconcileInterval;
+                    reconcile(context);
+                }
+                if (now >= next_stats)
+                {
+                    context.session.post_dht_stats();
+                    next_stats = now + kStatsInterval;
+                }
             }
             catch (const std::exception &error)
             {
-                std::cerr << "[Session " << context.id
-                          << "][Alert] 处理失败: " << error.what() << '\n';
-            }
-            catch (...)
-            {
-                std::cerr << "[Session " << context.id
-                          << "][Alert] 处理失败: 未知异常\n";
+                logging::error() << "[Session " << context.id
+                                 << "] 事件循环错误: " << error.what();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
     }
@@ -1256,8 +1371,16 @@ private:
     {
         if (auto *packet = lt::alert_cast<lt::dht_pkt_alert>(alert))
             handle_dht_packet(context, *packet);
+        else if (auto *added = lt::alert_cast<lt::add_torrent_alert>(alert))
+            on_torrent_added(context, *added);
         else if (auto *metadata = lt::alert_cast<lt::metadata_received_alert>(alert))
-            handle_metadata(context, *metadata);
+        {
+            const auto iterator = context.active_tasks.find(metadata->handle);
+            if (iterator != context.active_tasks.end())
+                persist_task(context, iterator);
+        }
+        else if (auto *metadata_failed = lt::alert_cast<lt::metadata_failed_alert>(alert))
+            fail_task(context, metadata_failed->handle, metadata_failed->error.message());
         else if (auto *torrent_error = lt::alert_cast<lt::torrent_error_alert>(alert))
             fail_task(context, torrent_error->handle, torrent_error->error.message());
         else if (auto *reply = lt::alert_cast<lt::dht_get_peers_reply_alert>(alert))
@@ -1266,18 +1389,48 @@ private:
             context.session.dht_live_nodes(stats->nid);
         else if (auto *nodes = lt::alert_cast<lt::dht_live_nodes_alert>(alert))
         {
-            std::cout << "[Session " << context.id
-                      << "][Stats] Nodes: " << nodes->num_nodes()
-                      << " Req: " << context.requests
-                      << " Resp: " << context.responses
-                      << " Active: " << context.active_tasks.size()
-                      << " Persisting: " << context.pending_writes.size() << '\n';
+            logging::info() << "[Session " << context.id
+                            << "][Stats] Nodes: " << nodes->num_nodes()
+                            << " Req: " << context.requests
+                            << " Resp: " << context.responses
+                            << " Checking: " << context.checking.size()
+                            << " Active: " << context.active_tasks.size() + context.adding.size()
+                            << " Persisting: " << storage_->stats().queued_jobs
+                            << " Busy: " << context.dropped_busy
+                            << " AlertDrops: " << context.alert_drops
+                            << " Orphans: " << context.orphans_removed;
         }
+        else if (auto *dropped = lt::alert_cast<lt::alerts_dropped_alert>(alert))
+            on_alerts_dropped(context, *dropped);
         else if (lt::alert_cast<lt::listen_failed_alert>(alert)
             || lt::alert_cast<lt::session_error_alert>(alert))
         {
-            std::cerr << "[Session " << context.id
-                      << "][libtorrent] " << alert->message() << '\n';
+            logging::error() << "[Session " << context.id
+                             << "][libtorrent] " << alert->message();
+        }
+    }
+
+    void on_alerts_dropped(SessionContext &context, const lt::alerts_dropped_alert &alert)
+    {
+        ++context.alert_drops;
+        const auto &types = alert.dropped_alerts;
+        // A lost state-change alert would strand its task until the TTL;
+        // reconcile() recovers it from the session's real torrent list.
+        if (types.test(lt::add_torrent_alert::alert_type)
+            || types.test(lt::metadata_received_alert::alert_type)
+            || types.test(lt::metadata_failed_alert::alert_type)
+            || types.test(lt::torrent_error_alert::alert_type))
+        {
+            context.reconcile_requested = true;
+        }
+
+        const auto now = Clock::now();
+        if (now - context.last_drop_log >= kAlertDropLogInterval)
+        {
+            context.last_drop_log = now;
+            logging::error() << "[Session " << context.id
+                             << "][libtorrent] alert 队列溢出，部分 alert 已被丢弃 (累计 "
+                             << context.alert_drops << " 次)";
         }
     }
 
@@ -1286,10 +1439,22 @@ private:
         if (packet.direction != lt::dht_pkt_alert::incoming)
             return;
 
+        const lt::span<char const> buffer = packet.pkt_buf();
         lt::error_code error;
-        const lt::bdecode_node message = lt::bdecode(packet.pkt_buf(), error);
-        if (error || message.type() != lt::bdecode_node::dict_t)
+        if (lt::bdecode(
+                buffer.data(),
+                buffer.data() + buffer.size(),
+                context.packet,
+                error,
+                nullptr,
+                kDhtPacketDepthLimit,
+                kDhtPacketTokenLimit)
+                != 0
+            || context.packet.type() != lt::bdecode_node::dict_t)
+        {
             return;
+        }
+        const lt::bdecode_node &message = context.packet;
 
         if (message.dict_find_string_value("y") != "q")
         {
@@ -1317,6 +1482,7 @@ private:
         if (hash.is_all_zeros())
             return;
 
+        // BEP 5: a non-zero implied_port means "use the UDP source port".
         const long long implied_port =
             arguments.dict_find_int_value("implied_port", 0);
         long long port = packet.node.port();
@@ -1325,7 +1491,7 @@ private:
         if (port <= 0 || port > kMaxPort)
             return;
 
-        submit_task(
+        submit_announce(
             context,
             hash,
             lt::tcp::endpoint(
@@ -1333,233 +1499,279 @@ private:
                 static_cast<std::uint16_t>(port)));
     }
 
-    void submit_task(SessionContext &context, const lt::sha1_hash &hash, const lt::tcp::endpoint &peer)
+    void submit_announce(
+        SessionContext &context,
+        const lt::sha1_hash &hash,
+        const lt::tcp::endpoint &peer)
     {
-        const auto now = std::chrono::steady_clock::now();
-        auto state = context.hash_states.find(hash);
-        if (state != context.hash_states.end())
+        if (stopping_.load())
+            return;
+        // Capacity first: a saturated crawler drops the announce without
+        // penalising the hash, so the next announce (in any session) can
+        // still pick it up.
+        if (context.slots_used() >= config_.max_active || storage_->under_pressure())
         {
-            if (state->second.status != HashStatus::failed
-                || now < state->second.retry_after)
-            {
-                return;
-            }
-        }
-
-        if (context.active_tasks.size() >= config_.max_active)
-        {
-            context.hash_states[hash] = {HashStatus::failed, now + config_.retry_delay};
+            ++context.dropped_busy;
             return;
         }
 
-        const std::string hash_hex = hash_to_hex(hash);
+        const InfoHash key = to_key(hash);
+        if (registry_.try_claim(key, Clock::now()) != HashRegistry::Claim::claimed)
+            return;
+        if (!reserve_global_slot())
+        {
+            registry_.release(key);
+            ++context.dropped_busy;
+            return;
+        }
+
         try
         {
-            if (database_.contains(hash_hex))
+            const auto entry = context.checking.emplace(key, peer).first;
+            if (!storage_->submit_lookup(context.id, key))
             {
-                context.hash_states[hash] = {
-                    HashStatus::completed,
-                    now + kCompletedCacheLifetime};
-                return;
+                context.checking.erase(entry);
+                registry_.release(key);
+                release_global_slot();
+                ++context.dropped_busy;
             }
-
-            lt::add_torrent_params parameters;
-            parameters.info_hashes.v1 = hash;
-            parameters.save_path = config_.temp_dir.string();
-            parameters.flags |= lt::torrent_flags::upload_mode;
-
-            lt::torrent_handle handle = context.session.add_torrent(std::move(parameters));
-            if (!handle.is_valid())
-            {
-                mark_failed(context, hash, now);
-                return;
-            }
-
-            handle.connect_peer(peer);
-            context.active_tasks.emplace(
-                handle,
-                ActiveTask{
-                    hash,
-                    hash_hex,
-                    peer,
-                    now + config_.metadata_timeout});
-            context.hash_states[hash] = {HashStatus::active, {}};
         }
-        catch (const std::exception &error)
+        catch (...)
         {
-            std::cerr << "[Session " << context.id
-                      << "][Fetcher] 启动 " << hash_hex
-                      << " 失败: " << error.what() << '\n';
-            mark_failed(context, hash, now);
+            context.checking.erase(key);
+            registry_.release(key);
+            release_global_slot();
+            throw;
         }
     }
 
-    void handle_metadata(SessionContext &context, const lt::metadata_received_alert &alert)
+    void handle_lookup_outcome(
+        SessionContext &context,
+        const LookupOutcome &outcome,
+        Clock::time_point now)
     {
-        auto task_iterator = context.active_tasks.find(alert.handle);
-        if (task_iterator == context.active_tasks.end())
+        const auto iterator = context.checking.find(outcome.hash);
+        if (iterator == context.checking.end())
             return;
+        const lt::tcp::endpoint peer = iterator->second;
+        context.checking.erase(iterator);
 
-        ActiveTask task = task_iterator->second;
+        if (outcome.result == storage::LookupResult::present)
+        {
+            registry_.settle_completed(outcome.hash, now + kCompletedCacheLifetime);
+            release_global_slot();
+            return;
+        }
+        if (outcome.result == storage::LookupResult::error || stopping_.load())
+        {
+            if (outcome.result == storage::LookupResult::error)
+                registry_.settle_failed(outcome.hash, now + config_.retry_delay);
+            else
+                registry_.release(outcome.hash);
+            release_global_slot();
+            return;
+        }
+
         try
         {
-            const std::shared_ptr<const lt::torrent_info> torrent_info =
-                alert.handle.torrent_file();
+            start_fetch(context, outcome.hash, peer, now);
+        }
+        catch (const std::exception &error)
+        {
+            logging::error() << "[Session " << context.id
+                             << "][Fetcher] 启动 " << storage::to_hex(outcome.hash)
+                             << " 失败: " << error.what();
+            registry_.settle_failed(outcome.hash, now + config_.retry_delay);
+            release_global_slot();
+        }
+    }
+
+    void start_fetch(
+        SessionContext &context,
+        const InfoHash &key,
+        const lt::tcp::endpoint &peer,
+        Clock::time_point now)
+    {
+        const Clock::time_point deadline = now + config_.metadata_timeout;
+        context.adding.emplace(key, PendingAdd{peer, deadline});
+        try
+        {
+            context.add_deadlines.push(DeadlineEntry<InfoHash>{deadline, key});
+
+            lt::add_torrent_params parameters;
+            parameters.info_hashes.v1 = from_key(key);
+            parameters.save_path = temp_dir_utf8_;
+            parameters.flags |= lt::torrent_flags::upload_mode;
+            // The defaults include auto_managed|paused, which queues the
+            // torrent behind active_downloads (3 per session): almost every
+            // task would time out waiting instead of fetching metadata.
+            parameters.flags &= ~(lt::torrent_flags::auto_managed | lt::torrent_flags::paused);
+            context.session.async_add_torrent(std::move(parameters));
+        }
+        catch (...)
+        {
+            context.adding.erase(key);
+            throw;
+        }
+    }
+
+    void on_torrent_added(SessionContext &context, const lt::add_torrent_alert &alert)
+    {
+        const InfoHash key = to_key(alert.params.info_hashes.v1);
+        const auto iterator = context.adding.find(key);
+        if (iterator == context.adding.end())
+        {
+            // Already timed out (or shutting down): never keep the torrent.
+            if (!alert.error && alert.handle.is_valid())
+                remove_torrent(context, alert.handle);
+            return;
+        }
+
+        const PendingAdd pending = iterator->second;
+        context.adding.erase(iterator);
+        if (alert.error || !alert.handle.is_valid())
+        {
+            logging::error() << "[Session " << context.id
+                             << "][Fetcher] 启动 " << storage::to_hex(key)
+                             << " 失败: " << alert.error.message();
+            registry_.settle_failed(key, Clock::now() + config_.retry_delay);
+            release_global_slot();
+            return;
+        }
+
+        const auto [task, inserted] = context.active_tasks.emplace(
+            alert.handle,
+            ActiveTask{key, storage::to_hex(key), pending.peer, pending.deadline});
+        if (!inserted)
+        {
+            // libtorrent returned a torrent that is already a task: this
+            // slot belongs to nobody.
+            registry_.settle_failed(key, Clock::now() + config_.retry_delay);
+            release_global_slot();
+            return;
+        }
+        context.task_deadlines.push(DeadlineEntry<lt::torrent_handle>{pending.deadline, alert.handle});
+        alert.handle.connect_peer(task->second.peer);
+    }
+
+    void persist_task(SessionContext &context, TaskMap::iterator iterator)
+    {
+        const ActiveTask task = iterator->second;
+        const lt::torrent_handle handle = iterator->first;
+        bool handed_off = false;
+        try
+        {
+            const std::shared_ptr<const lt::torrent_info> torrent_info = handle.torrent_file();
             if (!torrent_info)
                 throw std::runtime_error("metadata alert 未提供 torrent_info");
 
-            const fs::path torrent_path =
-                config_.torrent_dir / (task.hash_hex + ".torrent");
-            write_torrent_file(*torrent_info, torrent_path);
+            // write_torrent_file() only reads `ti`: it copies the verified
+            // info dictionary verbatim and, with allow_missing_piece_layer,
+            // never rebuilds v2 piece layers (the create_torrent path that
+            // crashed libtorrent 2.0.5 in set_hash2()).
+            lt::add_torrent_params parameters;
+            parameters.ti = std::const_pointer_cast<lt::torrent_info>(torrent_info);
 
-            TorrentRecord record{
-                task.hash_hex,
-                torrent_info->name(),
-                format_endpoint(task.peer)};
-            context.pending_writes.push_back(PendingWrite{
-                task.hash,
-                task.hash_hex,
-                database_.enqueue(std::move(record))});
-            context.hash_states[task.hash] = {HashStatus::persisting, {}};
-            std::cout << "[Session " << context.id
-                      << "][Fetcher] 已获取 " << task.hash_hex << " 的元数据\n";
+            storage::PersistJob job;
+            job.hash = task.key;
+            job.origin = context.id;
+            job.hash_hex = task.hash_hex;
+            job.name = torrent_info->name();
+            job.peer = format_endpoint(task.peer);
+            job.torrent_file = lt::write_torrent_file_buf(
+                parameters,
+                lt::write_flags::allow_missing_piece_layer);
+            if (!storage_->submit_persist(job))
+                throw std::runtime_error("写入队列已满");
+            handed_off = true;
+            logging::info() << "[Session " << context.id
+                            << "][Fetcher] 已获取 " << task.hash_hex << " 的元数据";
         }
         catch (const std::exception &error)
         {
-            std::cerr << "[Session " << context.id
-                      << "][Fetcher] 保存 " << task.hash_hex
-                      << " 失败: " << error.what() << '\n';
-            mark_failed(context, task.hash, std::chrono::steady_clock::now());
+            logging::error() << "[Session " << context.id
+                             << "][Fetcher] 保存 " << task.hash_hex
+                             << " 失败: " << error.what();
         }
 
-        remove_task(context, task_iterator);
+        // On hand-off the claim stays in flight until the writer settles it.
+        if (!handed_off)
+            registry_.settle_failed(task.key, Clock::now() + config_.retry_delay);
+        remove_task(context, iterator);
     }
 
-    void write_torrent_file(
-        const lt::torrent_info &torrent_info,
-        const fs::path &target_path)
+    void expire_tasks(SessionContext &context, Clock::time_point now)
     {
-        if (fs::exists(target_path))
-            return;
-
-        lt::create_torrent torrent(torrent_info);
-        const lt::entry entry = torrent.generate();
-        std::vector<char> buffer;
-        lt::bencode(std::back_inserter(buffer), entry);
-
-        fs::path temporary_path = target_path;
-        temporary_path += ".tmp";
-
+        while (!context.add_deadlines.empty() && context.add_deadlines.top().deadline <= now)
         {
-            std::ofstream output(
-                temporary_path,
-                std::ios::binary | std::ios::trunc);
-            if (!output)
-                throw std::runtime_error(
-                    "无法打开临时文件 " + temporary_path.string());
-            output.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-            output.close();
-            if (!output)
-            {
-                std::error_code ignored;
-                fs::remove(temporary_path, ignored);
-                throw std::runtime_error(
-                    "写入临时文件失败 " + temporary_path.string());
-            }
+            const DeadlineEntry<InfoHash> entry = context.add_deadlines.top();
+            context.add_deadlines.pop();
+            const auto iterator = context.adding.find(entry.key);
+            if (iterator == context.adding.end() || iterator->second.deadline != entry.deadline)
+                continue;
+
+            logging::error() << "[Session " << context.id
+                             << "][Fetcher] 超时: " << storage::to_hex(entry.key);
+            context.adding.erase(iterator);
+            registry_.settle_failed(entry.key, now + config_.retry_delay);
+            release_global_slot();
         }
 
-        std::error_code error;
-        fs::rename(temporary_path, target_path, error);
-        if (error)
+        while (!context.task_deadlines.empty() && context.task_deadlines.top().deadline <= now)
         {
-            fs::remove(temporary_path);
-            throw std::runtime_error(
-                "发布 torrent 文件失败: " + error.message());
+            const DeadlineEntry<lt::torrent_handle> entry = context.task_deadlines.top();
+            context.task_deadlines.pop();
+            const auto iterator = context.active_tasks.find(entry.key);
+            if (iterator == context.active_tasks.end() || iterator->second.deadline != entry.deadline)
+                continue;
+
+            logging::error() << "[Session " << context.id
+                             << "][Fetcher] 超时: " << iterator->second.hash_hex;
+            registry_.settle_failed(iterator->second.key, now + config_.retry_delay);
+            remove_task(context, iterator);
         }
     }
 
-    void expire_tasks(SessionContext &context, std::chrono::steady_clock::time_point now)
+    // Compares the session's real torrent list with the task table: torrents
+    // nobody tracks (their add alert was dropped or arrived after the
+    // timeout) are removed, and tasks whose metadata alert was dropped are
+    // persisted. Together with the deadlines this guarantees no torrent
+    // outlives metadata_timeout + kReconcileInterval.
+    void reconcile(SessionContext &context)
     {
-        for (auto iterator = context.active_tasks.begin(); iterator != context.active_tasks.end();)
+        const std::vector<lt::torrent_status> statuses = context.session.get_torrent_status(
+            [](const lt::torrent_status &) { return true; });
+        for (const lt::torrent_status &status : statuses)
         {
-            if (iterator->second.deadline > now)
+            const auto task = context.active_tasks.find(status.handle);
+            if (task != context.active_tasks.end())
             {
-                ++iterator;
+                if (status.has_metadata)
+                {
+                    ++context.metadata_recovered;
+                    persist_task(context, task);
+                }
                 continue;
             }
-
-            std::cerr << "[Session " << context.id
-                      << "][Fetcher] 超时: " << iterator->second.hash_hex << '\n';
-            mark_failed(context, iterator->second.hash, now);
-            iterator = remove_task(context, iterator);
-        }
-    }
-
-    void poll_database_writes(SessionContext &context, std::chrono::steady_clock::time_point now)
-    {
-        for (auto iterator = context.pending_writes.begin(); iterator != context.pending_writes.end();)
-        {
-            if (iterator->result.wait_for(std::chrono::seconds(0))
-                != std::future_status::ready)
-            {
-                ++iterator;
+            if (context.adding.count(to_key(status.info_hashes.v1)) != 0)
                 continue;
-            }
 
-            if (iterator->result.get())
-            {
-                context.hash_states[iterator->hash] = {
-                    HashStatus::completed,
-                    now + kCompletedCacheLifetime};
-                std::cout << "[Session " << context.id
-                          << "][DB] 已保存 " << iterator->hash_hex << '\n';
-            }
-            else
-            {
-                std::cerr << "[Session " << context.id
-                          << "][DB] 保存失败: " << iterator->hash_hex << '\n';
-                mark_failed(context, iterator->hash, now);
-            }
-            iterator = context.pending_writes.erase(iterator);
-        }
-    }
-
-    void expire_hash_states(SessionContext &context, std::chrono::steady_clock::time_point now)
-    {
-        for (auto iterator = context.hash_states.begin(); iterator != context.hash_states.end();)
-        {
-            if ((iterator->second.status == HashStatus::failed
-                    || iterator->second.status == HashStatus::completed)
-                && iterator->second.retry_after <= now)
-            {
-                iterator = context.hash_states.erase(iterator);
-            }
-            else
-            {
-                ++iterator;
-            }
+            ++context.orphans_removed;
+            remove_torrent(context, status.handle);
         }
     }
 
     void fail_task(SessionContext &context, const lt::torrent_handle &handle, const std::string &reason)
     {
-        auto iterator = context.active_tasks.find(handle);
+        const auto iterator = context.active_tasks.find(handle);
         if (iterator == context.active_tasks.end())
             return;
 
-        std::cerr << "[Session " << context.id
-                  << "][Fetcher] " << iterator->second.hash_hex
-                  << " 失败: " << reason << '\n';
-        mark_failed(context, iterator->second.hash, std::chrono::steady_clock::now());
+        logging::error() << "[Session " << context.id
+                         << "][Fetcher] " << iterator->second.hash_hex
+                         << " 失败: " << reason;
+        registry_.settle_failed(iterator->second.key, Clock::now() + config_.retry_delay);
         remove_task(context, iterator);
-    }
-
-    void mark_failed(
-        SessionContext &context,
-        const lt::sha1_hash &hash,
-        std::chrono::steady_clock::time_point now)
-    {
-        context.hash_states[hash] = {HashStatus::failed, now + config_.retry_delay};
     }
 
     void remove_torrent(SessionContext &context, const lt::torrent_handle &handle)
@@ -1572,8 +1784,8 @@ private:
         }
         catch (const std::exception &error)
         {
-            std::cerr << "[Session " << context.id
-                      << "][Fetcher] 清理 torrent 失败: " << error.what() << '\n';
+            logging::error() << "[Session " << context.id
+                             << "][Fetcher] 清理 torrent 失败: " << error.what();
         }
     }
 
@@ -1581,57 +1793,78 @@ private:
     {
         const lt::torrent_handle handle = iterator->first;
         auto next = context.active_tasks.erase(iterator);
+        release_global_slot();
         remove_torrent(context, handle);
         return next;
     }
 
     Config config_;
-    DatabaseManager database_;
+    std::string temp_dir_utf8_;
+    HashRegistry registry_;
+    std::size_t max_total_;
+    std::atomic<std::size_t> global_used_{0};
+    std::atomic<bool> stopping_{false};
+    std::vector<std::unique_ptr<Mailbox>> mailboxes_;
+    // Declared after the registry and mailboxes its callbacks use, so it is
+    // destroyed (and its threads joined) before them.
+    std::unique_ptr<storage::Storage> storage_;
     std::vector<std::unique_ptr<SessionContext>> sessions_;
     std::vector<std::thread> session_threads_;
     simple_net::TcpServer tracker_rpc_server_;
     std::mutex lookup_mutex_;
+    bool lookup_stopping_ = false;
     std::unordered_map<lt::sha1_hash, std::shared_ptr<PendingLookup>> pending_lookups_;
     std::atomic<std::size_t> next_lookup_session_{0};
-    std::atomic<bool> lookup_stopping_{false};
+    bool shut_down_ = false;
+    int exit_code_ = 0;
 };
 
 } // namespace
 
 int main(int argc, char *argv[])
 {
+    platform::ShutdownCompletionGuard shutdown_complete;
+    const std::vector<std::string> arguments = platform::utf8_arguments(argc, argv);
+    const std::string program = arguments.empty() ? "dht_db" : arguments.front();
     try
     {
-        for (int i = 1; i < argc; ++i)
+        for (std::size_t i = 1; i < arguments.size(); ++i)
         {
-            if (std::string_view(argv[i]) == "--help")
+            if (arguments[i] == "--help")
             {
-                print_usage(argv[0]);
+                print_usage(program);
                 return 0;
             }
         }
 
-        std::optional<Config> config = parse_arguments(argc, argv);
+        std::optional<Config> config = parse_arguments(arguments);
         if (!config)
         {
-            print_usage(argv[0]);
+            print_usage(program);
             return 1;
         }
 
-        std::signal(SIGINT, handle_signal);
-        std::signal(SIGTERM, handle_signal);
-
-        CrawlerApp app(std::move(*config));
-        return app.run();
+        platform::install_shutdown_handlers();
+        platform::raise_open_file_limit();
+        logging::start();
+        int result = 0;
+        {
+            CrawlerApp app(std::move(*config));
+            result = app.run();
+        }
+        logging::stop();
+        return result;
     }
     catch (const std::exception &error)
     {
-        std::cerr << "致命错误: " << error.what() << '\n';
+        logging::error() << "致命错误: " << error.what();
+        logging::stop();
         return 1;
     }
     catch (...)
     {
-        std::cerr << "致命错误: 未知异常\n";
+        logging::error() << "致命错误: 未知异常";
+        logging::stop();
         return 1;
     }
 }

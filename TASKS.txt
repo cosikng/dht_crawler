@@ -1,0 +1,65 @@
+You are acting as a Principal Systems Architect and Cross-Platform C++/Python Network Engineer. Your task is to first port this Linux-native BitTorrent DHT Crawler codebase (`dht_crawler-main`) to be 100% cross-platform compatible (Windows & Linux with identical runtime behavior), and then perform a deep-dive architectural audit, edge-case hardening, and performance optimization.
+
+### Project Context & Evolution
+1. This project was originally developed on Linux (C++ components like `tracker_server.cpp` + Python/`libtorrent` components), prototyped via web chat, and previously optimized using Codex.
+2. Check the repository for an existing completed `TODO` list from the previous optimization round. Read it first to understand the historical context and use it as inspiration.
+3. Currently, compiling on Windows fails immediately with POSIX header errors (e.g., `tracker_server.cpp:21:10: fatal error: arpa/inet.h: No such file or directory`).
+
+### Strict Invariants (DO NOT BREAK)
+- **Zero Platform-Specific Behavior Divergence**: The compiled program and scripts MUST exhibit the exact same functional, network, concurrency, and persistence behaviors on both Windows (MinGW/MSVC) and Linux (GCC/Clang).
+- **Multi-Session DHT Architecture**: Preserve the core design of running multiple `libtorrent` sessions simultaneously to maximize Kademlia DHT keyspace coverage.
+- **SQLite Output Schema & Format**: Strictly maintain the existing SQLite table schemas, column types, and data formatting conventions.
+- **Auxiliary HTTP Tracker**: Preserve the functional logic and protocol contract of `tracker_server.cpp` and related tracker components.
+
+---
+
+### Phase 0: Cross-Platform Portability (Windows & Linux Unification)
+Before doing any optimization, inspect all C/C++ source files (such as `tracker_server.cpp`), build scripts (`CMakeLists.txt` / `Makefile` / setup scripts), and Python bindings. Create a clean, unified cross-platform abstraction layer:
+
+1. **Socket & Network API Abstraction**:
+   - Guard POSIX headers (`<arpa/inet.h>`, `<sys/socket.h>`, `<netinet/in.h>`, `<unistd.h>`, `<fcntl.h>`) vs. Windows headers (`<winsock2.h>`, `<ws2tcpip.h>`, `<windows.h>`). Ensure `WIN32_LEAN_AND_MEAN` and `NOMINMAX` are defined on Windows before including headers.
+   - Implement RAII initialization/teardown for `WSAStartup` and `WSACleanup` on Windows so it is completely transparent to the rest of the code.
+   - Unify socket types (`socket_t`: `SOCKET` on Windows vs. `int` on Linux), invalid socket checks (`INVALID_SOCKET` vs. `< 0`), and socket closure (`closesocket()` vs. `close()`).
+   - Unify non-blocking socket configuration (`ioctlsocket` with `FIONBIO` vs. `fcntl` with `O_NONBLOCK`) and error code retrieval (`WSAGetLastError()` / `WSAEWOULDBLOCK` / `WSAEINTR` vs. `errno` / `EAGAIN` / `EINTR`).
+   - Normalize `setsockopt` pointer casts (`const char*` vs `const void*`) and ensure `SO_REUSEADDR` behaves identically without allowing port hijacking on Windows.
+   - If Linux-specific I/O multiplexing (like `epoll`) is used in `tracker_server.cpp`, refactor it into a clean cross-platform polling mechanism (e.g., `WSAPoll` / `poll` or standard portable reactor) with identical timeout and event semantics.
+2. **Filesystem, Endianness & Build System**:
+   - Ensure byte-order functions (`htons`, `ntohl`, `inet_pton`, `inet_ntop`) and fixed-width integers (`uint32_t`, `ssize_t`) work cleanly across both platforms.
+   - Ensure atomic state file replacements (e.g., saving DHT routing tables or temporary files) handle the Windows vs. POSIX `rename()` difference (Windows fails if the destination file already exists).
+   - Update build scripts / compiler flags to link `ws2_32` (`-lws2_32`) automatically when building on Windows, and verify that `tracker_server.cpp` compiles cleanly on this Windows machine with zero warnings.
+
+---
+
+### Phase 1: Deep-Dive Audit (Concurrency, State Machines & Extreme Edge Cases)
+Once the cross-platform port is verified and compiles on Windows, audit the entire system against the following extreme edge cases and architectural bottlenecks:
+
+1. **Multi-Session `libtorrent` Mechanics & Alert Loop Starvation**:
+   - **Alert Queue Overflow**: Check if `pop_alerts()` across multiple sessions risks hitting `alert_queue_size_limit` under burst traffic. Ensure zero blocking I/O or heavy CPU parsing occurs inside the tight alert polling loop.
+   - **Zombie Torrent Handles (Memory Leak)**: If the crawler fetches metadata (`ut_metadata` / BEP-9), audit the lifecycle state machine of `torrent_handle`s. Ensure 100% of dead/stalled magnet fetches are deterministically evicted and removed after a strict TTL to prevent C++ heap leaks.
+   - **Bootstrap & Routing Table Persistence**: Audit how multiple sessions save/load their DHT state (`save_state` / `load_state`) and whether their Node IDs or bootstrap timings collide.
+2. **Concurrency, Lock Contention & Backpressure**:
+   - Audit the data flow from multiple `libtorrent` sessions + the C++/HTTP Tracker into the processing queues.
+   - Check for unbounded in-memory queues/sets (e.g., `info_hash` deduplication caches) that could cause OOM after weeks of uptime. Verify bounded LRU/TTL structures or Bloom filters.
+   - Check thread/async/IPC boundaries for race conditions or deadlocks.
+3. **SQLite High-Concurrency & WAL Starvation**:
+   - Audit how writes from multiple sessions and the tracker are serialized into SQLite.
+   - Check for potential `SQLITE_BUSY` / `database is locked` exceptions under burst writes (note that Windows file locking semantics on SQLite WAL files are stricter than Linux!).
+   - Verify PRAGMA settings (`journal_mode=WAL`, `synchronous`, `busy_timeout`) and prevent **WAL Checkpoint Starvation** (unbounded `.wal` file growth).
+4. **HTTP Tracker Edge Cases (`tracker_server.cpp`) & Protocol Poisoning**:
+   - Audit the C++ HTTP tracker against buffer overflows, malformed `info_hash` / `peer_id` query parameters (non-20-byte lengths, broken URL-encoding), oversized payloads, socket descriptor leaks on half-open connections, and malformed bencode generation.
+5. **Graceful Shutdown & Cross-Platform Signal Handling**:
+   - Ensure signal handling works identically on Windows (`SetConsoleCtrlHandler` / `SIGINT` / `SIGBREAK`) and Linux (`SIGINT` / `SIGTERM`), cleanly stopping the C++ tracker, flushing all pending queues to SQLite, and persisting all `libtorrent` session states without hanging or corrupting files.
+
+---
+
+### Phase 2: Execution Workflow (Autonomous Loop)
+
+Execute this task autonomously in the following order:
+
+1. **Comprehensive Audit Report**: Generate `AUDIT_AND_OPTIMIZATION_REPORT.md` documenting: (a) all Linux-specific dependencies found, and (b) architectural/concurrency vulnerabilities across the 5 areas above, ranked by severity with exact file and line references.
+2. **Cross-Platform Port & Targeted Refactoring**: Implement the Phase 0 cross-platform abstraction and Phase 1 optimizations directly in the codebase. Compile the C++ components (`tracker_server.cpp`, etc.) right here in the Windows terminal to prove the build succeeds cleanly.
+3. **Automated Cross-Platform Stress & Edge-Case Test Suite**: Write and execute an automated test suite verifying:
+   - The compiled C++ `tracker_server` binary starts up, accepts concurrent connections, handles malformed `info_hash` requests without crashing or leaking sockets, and shuts down cleanly on Windows.
+   - Concurrent high-frequency writes to the SQLite storage layer pass without locking/permission errors on Windows NTFS.
+   - Memory bounds on deduplication caches work as expected.
+4. **Self-Verification**: Run the compiler and test suite in the terminal yourself. Debug and fix any Windows-specific socket/file-locking quirks until 100% of tests pass. Finally, update `AUDIT_AND_OPTIMIZATION_REPORT.md` with a summary of all cross-platform abstractions, bug fixes, and test results.

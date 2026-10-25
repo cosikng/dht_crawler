@@ -4,7 +4,10 @@ dht_state/
 build/
 dht_db
 dht_crawler.db
+dht_crawler.db-wal
+dht_crawler.db-shm
 *.txt
 !CMakeLists.txt
 .idea/
 cmake*/
+__pycache__/
