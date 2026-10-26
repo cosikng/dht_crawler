@@ -3,6 +3,7 @@
 #include "logger.hpp"
 #include "platform.hpp"
 #include "simple_network.hpp"
+#include "torrent_file_list.hpp"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +36,7 @@
 #include <libtorrent/bdecode.hpp>
 #include <libtorrent/session.hpp>
 #include <libtorrent/session_params.hpp>
+#include <libtorrent/session_stats.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/sha1_hash.hpp>
 #include <libtorrent/torrent_info.hpp>
@@ -78,6 +80,8 @@ constexpr int kAlertQueueSize = 10000;
 // The limits libtorrent itself applies to incoming DHT messages.
 constexpr int kDhtPacketDepthLimit = 10;
 constexpr int kDhtPacketTokenLimit = 500;
+// "announce_peer" as it appears, bencoded, in every announce_peer query.
+constexpr std::string_view kAnnouncePeerToken = "13:announce_peer";
 
 struct Config
 {
@@ -95,6 +99,12 @@ struct Config
     fs::path database_path = "dht_crawler.db";
     fs::path temp_dir = "tmp";
     fs::path torrent_dir = "torrents";
+    // Off by default: only the database row is stored per info-hash.
+    bool save_torrents = false;
+    // On by default: each torrent's file list goes into this standalone
+    // index (file_index.hpp), queried with the dht_files tool.
+    fs::path file_index_path = "dht_files.db";
+    bool file_index_enabled = true;
     fs::path dht_state_dir = "dht_state";
     bool reinitialize_dht = false;
     std::chrono::seconds dht_save_interval{900};
@@ -186,7 +196,8 @@ void print_usage(const std::string &program)
         << "  --dedup-cache-size N       去重缓存最大条目数，默认 262144\n"
         << "  --database PATH            SQLite 数据库路径\n"
         << "  --temp-dir PATH            libtorrent 临时目录\n"
-        << "  --torrent-dir PATH         torrent 文件目录\n"
+        << "  --save-torrents            保存完整 .torrent 文件，默认不保存\n"
+        << "  --torrent-dir PATH         .torrent 文件目录（配合 --save-torrents），默认 torrents\n"
         << "  --dht-state-dir PATH       DHT 状态目录，默认 dht_state\n"
         << "  --dht-save-interval SEC    定期保存 DHT 状态的间隔，默认 900 秒\n"
         << "  --bootstrap-stagger-ms MS  相邻会话启动间隔，默认 200 毫秒\n"
@@ -195,6 +206,8 @@ void print_usage(const std::string &program)
         << "  --tracker-rpc-port PORT    tracker RPC 端口，默认 19091\n"
         << "  --tracker-timeout SEC      DHT 查询超时，默认 8 秒\n"
         << "  --disable-tracker-rpc      禁用 tracker RPC 服务\n"
+        << "  --file-index PATH          文件列表索引路径，默认 dht_files.db\n"
+        << "  --disable-file-index       不记录文件列表（默认记录，可用 dht_files 查询）\n"
         << "  --bootstrap-nodes NODES    DHT bootstrap 节点列表\n"
         << "  --help                     显示帮助";
 }
@@ -222,6 +235,16 @@ std::optional<Config> parse_arguments(const std::vector<std::string> &arguments)
             if (option == "--reinitialize-dht")
             {
                 config.reinitialize_dht = true;
+                continue;
+            }
+            if (option == "--save-torrents")
+            {
+                config.save_torrents = true;
+                continue;
+            }
+            if (option == "--disable-file-index")
+            {
+                config.file_index_enabled = false;
                 continue;
             }
             if (option == "--disable-tracker-rpc")
@@ -284,6 +307,8 @@ std::optional<Config> parse_arguments(const std::vector<std::string> &arguments)
                 config.temp_dir = platform::path_from_utf8(value);
             else if (option == "--torrent-dir")
                 config.torrent_dir = platform::path_from_utf8(value);
+            else if (option == "--file-index")
+                config.file_index_path = platform::path_from_utf8(value);
             else if (option == "--dht-state-dir")
                 config.dht_state_dir = platform::path_from_utf8(value);
             else if (option == "--dht-save-interval")
@@ -334,6 +359,7 @@ std::optional<Config> parse_arguments(const std::vector<std::string> &arguments)
         || config.dedup_cache_size == 0
         || config.dedup_cache_size > kMaxDedupCacheSize
         || config.database_path.empty()
+        || config.file_index_path.empty()
         || config.temp_dir.empty()
         || config.torrent_dir.empty()
         || config.dht_state_dir.empty()
@@ -476,6 +502,48 @@ std::string build_listen_interfaces(const Config &config)
     return interfaces;
 }
 
+// Indices of libtorrent's DHT session counters. libtorrent counts every
+// message it receives, every one it drops (mostly queries beyond the
+// dht_upload_rate_limit quota) and every request it handles, by type.
+struct DhtCounters
+{
+    int messages_in = -1;
+    int messages_dropped = -1;
+    std::vector<int> requests;
+
+    static const DhtCounters &get()
+    {
+        static const DhtCounters counters = [] {
+            DhtCounters result;
+            result.messages_in = lt::find_metric_idx("dht.dht_messages_in");
+            result.messages_dropped = lt::find_metric_idx("dht.dht_messages_in_dropped");
+            // Each request type has a disjoint valid/invalid pair.
+            for (const char *name : {
+                     "dht.dht_ping_in",
+                     "dht.dht_find_node_in",
+                     "dht.dht_invalid_find_node",
+                     "dht.dht_get_peers_in",
+                     "dht.dht_invalid_get_peers",
+                     "dht.dht_announce_peer_in",
+                     "dht.dht_invalid_announce",
+                     "dht.dht_get_in",
+                     "dht.dht_invalid_get",
+                     "dht.dht_put_in",
+                     "dht.dht_invalid_put",
+                     "dht.dht_sample_infohashes_in",
+                     "dht.dht_invalid_sample_infohashes",
+                 })
+            {
+                const int index = lt::find_metric_idx(name);
+                if (index >= 0)
+                    result.requests.push_back(index);
+            }
+            return result;
+        }();
+        return counters;
+    }
+};
+
 struct KeyHasher
 {
     std::size_t operator()(const InfoHash &key) const noexcept
@@ -557,7 +625,11 @@ public:
 
         storage::Options options;
         options.database_path = config_.database_path;
-        options.torrent_dir = config_.torrent_dir;
+        // An empty torrent_dir tells storage not to write .torrent files.
+        if (config_.save_torrents)
+            options.torrent_dir = config_.torrent_dir;
+        if (config_.file_index_enabled)
+            options.file_index_path = config_.file_index_path;
         storage_ = std::make_unique<storage::Storage>(
             options,
             [this](int tag, const InfoHash &hash, storage::LookupResult result) {
@@ -669,8 +741,10 @@ private:
         DeadlineQueue<lt::torrent_handle> task_deadlines;
         bool reconcile_requested = false;
         Clock::time_point last_drop_log{};
-        std::uint64_t requests = 0;
-        std::uint64_t responses = 0;
+        // Totals from libtorrent's session counters (see DhtCounters).
+        std::int64_t dht_requests = 0;
+        std::int64_t dht_responses = 0;
+        std::int64_t dht_dropped = 0;
         std::uint64_t dropped_busy = 0;
         std::uint64_t alert_drops = 0;
         std::uint64_t orphans_removed = 0;
@@ -691,14 +765,17 @@ private:
         };
 
         create_directory(config.temp_dir, "临时目录");
-        create_directory(config.torrent_dir, " torrent 目录");
+        if (config.save_torrents)
+            create_directory(config.torrent_dir, " torrent 目录");
         create_directory(config.dht_state_dir, " DHT 状态目录");
         if (config.database_path.has_parent_path())
             create_directory(config.database_path.parent_path(), "数据库目录");
+        if (config.file_index_enabled && config.file_index_path.has_parent_path())
+            create_directory(config.file_index_path.parent_path(), "文件索引目录");
 
-        const std::size_t stale =
-            platform::remove_stale_temp_files(config.torrent_dir)
-            + platform::remove_stale_temp_files(config.dht_state_dir);
+        std::size_t stale = platform::remove_stale_temp_files(config.dht_state_dir);
+        if (config.save_torrents)
+            stale += platform::remove_stale_temp_files(config.torrent_dir);
         if (stale > 0)
             logging::info() << "已清理 " << stale << " 个残留临时文件";
         return config;
@@ -1354,6 +1431,9 @@ private:
                 }
                 if (now >= next_stats)
                 {
+                    // session_stats_alert arrives before the live-nodes
+                    // reply that prints the stats line.
+                    context.session.post_session_stats();
                     context.session.post_dht_stats();
                     next_stats = now + kStatsInterval;
                 }
@@ -1387,12 +1467,15 @@ private:
             complete_lookup(reply->info_hash, reply->peers());
         else if (auto *stats = lt::alert_cast<lt::dht_stats_alert>(alert))
             context.session.dht_live_nodes(stats->nid);
+        else if (auto *session_stats = lt::alert_cast<lt::session_stats_alert>(alert))
+            update_dht_counters(context, *session_stats);
         else if (auto *nodes = lt::alert_cast<lt::dht_live_nodes_alert>(alert))
         {
             logging::info() << "[Session " << context.id
                             << "][Stats] Nodes: " << nodes->num_nodes()
-                            << " Req: " << context.requests
-                            << " Resp: " << context.responses
+                            << " Req: " << context.dht_requests
+                            << " Resp: " << context.dht_responses
+                            << " Dropped: " << context.dht_dropped
                             << " Checking: " << context.checking.size()
                             << " Active: " << context.active_tasks.size() + context.adding.size()
                             << " Persisting: " << storage_->stats().queued_jobs
@@ -1408,6 +1491,28 @@ private:
             logging::error() << "[Session " << context.id
                              << "][libtorrent] " << alert->message();
         }
+    }
+
+    // Req: requests libtorrent handled. Dropped: messages it discarded
+    // (mostly queries beyond its upload quota; their announce_peer ones are
+    // still captured from the packet alert). Resp: the rest, i.e. replies
+    // and errors.
+    static void update_dht_counters(SessionContext &context, const lt::session_stats_alert &alert)
+    {
+        const DhtCounters &indices = DhtCounters::get();
+        const auto values = alert.counters();
+        auto value = [&values](int index) -> std::int64_t {
+            return index >= 0 && index < static_cast<int>(values.size()) ? values[index] : 0;
+        };
+
+        std::int64_t requests = 0;
+        for (const int index : indices.requests)
+            requests += value(index);
+        const std::int64_t dropped = value(indices.messages_dropped);
+        context.dht_requests = requests;
+        context.dht_dropped = dropped;
+        context.dht_responses = std::max<std::int64_t>(
+            value(indices.messages_in) - dropped - requests, 0);
     }
 
     void on_alerts_dropped(SessionContext &context, const lt::alerts_dropped_alert &alert)
@@ -1439,7 +1544,18 @@ private:
         if (packet.direction != lt::dht_pkt_alert::incoming)
             return;
 
+        // Every announce_peer query carries its bencoded name, so packets
+        // without it are skipped before any parsing. That is most of the
+        // traffic, and libtorrent has already decoded each packet once;
+        // request/response totals come from its session counters instead.
         const lt::span<char const> buffer = packet.pkt_buf();
+        if (std::string_view(buffer.data(), static_cast<std::size_t>(buffer.size()))
+                .find(kAnnouncePeerToken)
+            == std::string_view::npos)
+        {
+            return;
+        }
+
         lt::error_code error;
         if (lt::bdecode(
                 buffer.data(),
@@ -1456,15 +1572,12 @@ private:
         }
         const lt::bdecode_node &message = context.packet;
 
-        if (message.dict_find_string_value("y") != "q")
+        // The token can also occur inside some other string value.
+        if (message.dict_find_string_value("y") != "q"
+            || message.dict_find_string_value("q") != "announce_peer")
         {
-            ++context.responses;
             return;
         }
-
-        ++context.requests;
-        if (message.dict_find_string_value("q") != "announce_peer")
-            return;
 
         const lt::bdecode_node arguments = message.dict_find("a");
         if (arguments.type() != lt::bdecode_node::dict_t)
@@ -1665,22 +1778,33 @@ private:
             if (!torrent_info)
                 throw std::runtime_error("metadata alert 未提供 torrent_info");
 
-            // write_torrent_file() only reads `ti`: it copies the verified
-            // info dictionary verbatim and, with allow_missing_piece_layer,
-            // never rebuilds v2 piece layers (the create_torrent path that
-            // crashed libtorrent 2.0.5 in set_hash2()).
-            lt::add_torrent_params parameters;
-            parameters.ti = std::const_pointer_cast<lt::torrent_info>(torrent_info);
-
             storage::PersistJob job;
             job.hash = task.key;
             job.origin = context.id;
             job.hash_hex = task.hash_hex;
             job.name = torrent_info->name();
             job.peer = format_endpoint(task.peer);
-            job.torrent_file = lt::write_torrent_file_buf(
-                parameters,
-                lt::write_flags::allow_missing_piece_layer);
+            if (config_.file_index_enabled)
+            {
+                job.file_list = file_list_from_info(task.key, torrent_info->info_section());
+                if (!job.file_list)
+                {
+                    logging::error() << "[Session " << context.id
+                                     << "][FileIndex] 无法解析 " << task.hash_hex << " 的文件列表";
+                }
+            }
+            if (config_.save_torrents)
+            {
+                // write_torrent_file() only reads `ti`: it copies the verified
+                // info dictionary verbatim and, with allow_missing_piece_layer,
+                // never rebuilds v2 piece layers (the create_torrent path that
+                // crashed libtorrent 2.0.5 in set_hash2()).
+                lt::add_torrent_params parameters;
+                parameters.ti = std::const_pointer_cast<lt::torrent_info>(torrent_info);
+                job.torrent_file = lt::write_torrent_file_buf(
+                    parameters,
+                    lt::write_flags::allow_missing_piece_layer);
+            }
             if (!storage_->submit_persist(job))
                 throw std::runtime_error("写入队列已满");
             handed_off = true;

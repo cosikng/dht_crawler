@@ -31,6 +31,7 @@ import unittest
 IS_WINDOWS = os.name == "nt"
 TRACKER = None
 CRAWLER = None
+FILES_TOOL = None
 
 
 # --------------------------------------------------------------------------
@@ -296,6 +297,23 @@ class FakeCrawler(socketserver.ThreadingTCPServer):
 
 # --------------------------------------------------------------------------
 # fake DHT node and BitTorrent peer for crawler tests
+
+def make_multi_file_torrent(name, files, piece_length=16384):
+    """files: (path components, length, attr or None)."""
+    entries = []
+    total = 0
+    for path, length, attr in files:
+        entry = {b"length": length, b"path": [component.encode("utf-8") for component in path]}
+        if attr:
+            entry[b"attr"] = attr.encode()
+        entries.append(entry)
+        total += length
+    pieces = (total + piece_length - 1) // piece_length
+    info = {b"files": entries, b"name": name.encode("utf-8"), b"piece length": piece_length,
+            b"pieces": b"\x00" * (20 * pieces)}
+    encoded = bencode(info)
+    return hashlib.sha1(encoded).digest(), encoded
+
 
 def make_torrent(name, length):
     info = {b"length": length, b"name": name.encode("utf-8"), b"piece length": 16384,
@@ -825,6 +843,7 @@ def wait_for_database_row(database, info_hash, timeout=40):
 
 def crawler_storage_args(root):
     return ["--database", os.path.join(root, "db", "crawler.db"),
+            "--file-index", os.path.join(root, "db", "files.db"),
             "--temp-dir", os.path.join(root, "tmp"),
             "--torrent-dir", os.path.join(root, "torrents"),
             "--dht-state-dir", os.path.join(root, "state")]
@@ -838,14 +857,16 @@ class CrawlerTests(unittest.TestCase):
         os.makedirs(root)
         cls.root = root
         cls.database = os.path.join(root, "db", "crawler.db")
+        cls.file_index = os.path.join(root, "db", "files.db")
         cls.first_port = free_port_pair()
         cls.rpc_port = free_port()
         cls.args = [CRAWLER, "--bind", "127.0.0.1", "--listeners", 2, "--first-port", cls.first_port,
                     "--bootstrap-nodes", "127.0.0.1:%d" % free_port(udp_too=True),
                     "--bootstrap-stagger-ms", 50, "--metadata-timeout", 20, "--retry-delay", 5,
                     "--tracker-rpc-bind", "127.0.0.1", "--tracker-rpc-port", cls.rpc_port,
-                    "--tracker-timeout", 2,
+                    "--tracker-timeout", 2, "--save-torrents",
                     "--database", cls.database,
+                    "--file-index", cls.file_index,
                     "--temp-dir", os.path.join(root, "tmp"),
                     "--torrent-dir", os.path.join(root, "torrents"),
                     "--dht-state-dir", os.path.join(root, "state")]
@@ -949,6 +970,42 @@ class CrawlerTests(unittest.TestCase):
         finally:
             peer.close()
 
+    def test_4b_file_index_records_the_tree(self):
+        if not FILES_TOOL:
+            self.skipTest("--files-tool not given")
+        info_hash, info = make_multi_file_torrent("合集", [
+            (["docs", "说明.txt"], 1500, None),
+            ([".pad", "14884"], 14884, "p"),  # BEP 47 padding: not listed
+            (["video", "part 1.mkv"], 2500000, None),
+            (["video", "sub", "a.srt"], 10, None),
+        ])
+        peer = FakePeer({info_hash: info})
+        try:
+            send_announce(self.first_port, info_hash, peer.port)
+            # The file list is committed before the crawler row.
+            self.assertIsNotNone(self.wait_for_row(info_hash), self.crawler.output())
+        finally:
+            peer.close()
+
+        result = subprocess.run([FILES_TOOL, "--index", self.file_index, info_hash.hex()],
+                                capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertEqual(result.stdout.decode("utf-8"), (
+            "%s  合集\n"
+            "3 files, 2.4 MiB\n"
+            "合集/  [2.4 MiB]\n"
+            "├── docs/  [1.5 KiB]\n"
+            "│   └── 说明.txt  [1.5 KiB]\n"
+            "└── video/  [2.4 MiB]\n"
+            "    ├── part 1.mkv  [2.4 MiB]\n"
+            "    └── sub/  [10 B]\n"
+            "        └── a.srt  [10 B]\n") % info_hash.hex())
+
+        missing = subprocess.run([FILES_TOOL, "--index", self.file_index, "00" * 20, "nothex"],
+                                 capture_output=True, timeout=30)
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("未找到: " + "00" * 20, missing.stderr.decode("utf-8"))
+
     def test_5_graceful_shutdown_persists_everything(self):
         code, seconds = self.crawler.stop(timeout=60)
         output = self.crawler.output()
@@ -963,8 +1020,9 @@ class CrawlerTests(unittest.TestCase):
         for directory in ("state", "torrents"):
             leftovers = [n for n in os.listdir(os.path.join(self.root, directory)) if n.endswith(".tmp")]
             self.assertEqual(leftovers, [])
-        wal = self.database + "-wal"
-        self.assertTrue(not os.path.exists(wal) or os.path.getsize(wal) == 0)
+        for database in (self.database, self.file_index):
+            wal = database + "-wal"
+            self.assertTrue(not os.path.exists(wal) or os.path.getsize(wal) == 0, wal)
 
         with contextlib.closing(sqlite3.connect(self.database)) as db:
             columns = db.execute("PRAGMA table_info(torrents)").fetchall()
@@ -1086,6 +1144,8 @@ class DualStackCrawlerTests(unittest.TestCase):
             self.assertIsNotNone(row4, self.crawler.output())
             self.assertEqual(row6[2], "[::1]:%d" % peer6.port)
             self.assertEqual(row4[2], "127.0.0.1:%d" % peer4.port)
+            # Without --save-torrents only the rows are stored.
+            self.assertFalse(os.path.exists(os.path.join(self.root, "torrents")))
         finally:
             peer6.close()
             peer4.close()
@@ -1130,13 +1190,15 @@ class DualStackCrawlerTests(unittest.TestCase):
 
 
 def main():
-    global TRACKER, CRAWLER
+    global TRACKER, CRAWLER, FILES_TOOL
     parser = argparse.ArgumentParser()
     parser.add_argument("--tracker", required=True)
     parser.add_argument("--crawler")
+    parser.add_argument("--files-tool")
     options, remaining = parser.parse_known_args()
     TRACKER = os.path.abspath(options.tracker)
     CRAWLER = os.path.abspath(options.crawler) if options.crawler else None
+    FILES_TOOL = os.path.abspath(options.files_tool) if options.files_tool else None
     suite = unittest.TestSuite()
     loader = unittest.TestLoader()
     suite.addTests(loader.loadTestsFromTestCase(TrackerTests))

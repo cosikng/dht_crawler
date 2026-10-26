@@ -186,6 +186,14 @@ Storage::Storage(Options options, LookupHandler on_lookup, PersistHandler on_per
         "INSERT OR IGNORE INTO torrents "
         "(info_hash, name, discovered_peer) VALUES (?, ?, ?);");
 
+    if (!options_.file_index_path.empty())
+    {
+        file_index_ = std::make_unique<file_index::FileIndex>(
+            options_.file_index_path,
+            file_index::FileIndex::Mode::read_write,
+            options_.busy_timeout);
+    }
+
     reader_ = std::make_unique<Connection>(options_.database_path, options_.busy_timeout);
     reader_->execute("PRAGMA query_only=1;");
     contains_statement_ = std::make_unique<Statement>(
@@ -229,7 +237,7 @@ bool Storage::submit_persist(PersistJob &job)
 {
     {
         std::lock_guard<std::mutex> lock(write_mutex_);
-        const std::size_t size = job.torrent_file.size();
+        const std::size_t size = job_bytes(job);
         if (write_stopping_
             || jobs_.size() >= options_.max_persist_jobs
             || (queued_bytes_ > 0 && queued_bytes_ + size > options_.max_persist_bytes))
@@ -390,7 +398,7 @@ void Storage::writer_loop()
                 batch.reserve(count);
                 for (std::size_t i = 0; i < count; ++i)
                 {
-                    queued_bytes_ -= jobs_.front().torrent_file.size();
+                    queued_bytes_ -= job_bytes(jobs_.front());
                     batch.push_back(std::move(jobs_.front()));
                     jobs_.pop_front();
                 }
@@ -457,20 +465,23 @@ void Storage::report(const PersistJob &job, bool persisted) noexcept
 // it does so before any job has been reported.
 void Storage::process_batch(std::vector<PersistJob> &batch)
 {
-    std::vector<const PersistJob *> rows;
+    std::vector<PersistJob *> rows;
     rows.reserve(batch.size());
     for (PersistJob &job : batch)
     {
         try
         {
-            const fs::path target = options_.torrent_dir / (job.hash_hex + ".torrent");
-            std::error_code exists_error;
-            if (!fs::exists(target, exists_error))
+            if (!options_.torrent_dir.empty())
             {
-                platform::write_file_atomic(
-                    target,
-                    std::string_view(job.torrent_file.data(), job.torrent_file.size()),
-                    false);
+                const fs::path target = options_.torrent_dir / (job.hash_hex + ".torrent");
+                std::error_code exists_error;
+                if (!fs::exists(target, exists_error))
+                {
+                    platform::write_file_atomic(
+                        target,
+                        std::string_view(job.torrent_file.data(), job.torrent_file.size()),
+                        false);
+                }
             }
             rows.push_back(&job);
         }
@@ -488,7 +499,12 @@ void Storage::process_batch(std::vector<PersistJob> &batch)
     {
         try
         {
-            inserted = insert_rows(rows);
+            // File lists first: if they fail no crawler row is written, the
+            // hashes are fetched again later and both stores stay in step.
+            inserted = write_file_lists(rows)
+                && commit_with_retry("[DB]", [&](std::string &error) {
+                       return try_insert(rows, error);
+                   });
         }
         catch (const std::exception &error)
         {
@@ -500,7 +516,42 @@ void Storage::process_batch(std::vector<PersistJob> &batch)
     batch.clear();
 }
 
-bool Storage::insert_rows(const std::vector<const PersistJob *> &rows)
+bool Storage::write_file_lists(const std::vector<PersistJob *> &rows)
+{
+    if (!file_index_)
+        return true;
+
+    std::vector<file_index::Entry> entries;
+    for (PersistJob *job : rows)
+    {
+        if (job->file_list)
+            entries.push_back(std::move(*job->file_list));
+    }
+    if (entries.empty())
+        return true;
+
+    return commit_with_retry("[FileIndex]", [&](std::string &error) {
+        const file_index::Result result = file_index_->put(entries);
+        error = result.message;
+        if (result.status == file_index::Status::ok)
+            return SQLITE_OK;
+        return result.status == file_index::Status::busy ? SQLITE_BUSY : SQLITE_ERROR;
+    });
+}
+
+std::size_t Storage::job_bytes(const PersistJob &job)
+{
+    std::size_t bytes = job.torrent_file.size();
+    if (job.file_list)
+    {
+        bytes += job.file_list->name.size();
+        for (const file_index::File &file : job.file_list->files)
+            bytes += file.path.size() + sizeof(file_index::File);
+    }
+    return bytes;
+}
+
+bool Storage::commit_with_retry(const char *label, const std::function<int(std::string &)> &attempt)
 {
     auto backoff = std::chrono::milliseconds(50);
     auto last_busy_log = std::chrono::steady_clock::time_point{};
@@ -508,7 +559,7 @@ bool Storage::insert_rows(const std::vector<const PersistJob *> &rows)
     while (true)
     {
         std::string error;
-        const int result = try_insert(rows, error);
+        const int result = attempt(error);
         if (result == SQLITE_OK)
             return true;
 
@@ -526,13 +577,13 @@ bool Storage::insert_rows(const std::vector<const PersistJob *> &rows)
             }
             if (give_up)
             {
-                logging::error() << "[DB] 退出时数据库仍被占用，放弃剩余记录: " << error;
+                logging::error() << label << " 退出时数据库仍被占用，放弃剩余记录: " << error;
                 abandon_writes_ = true;
                 return false;
             }
             if (now - last_busy_log >= kBusyLogInterval)
             {
-                logging::error() << "[DB] 数据库被占用，稍后重试: " << error;
+                logging::error() << label << " 数据库被占用，稍后重试: " << error;
                 last_busy_log = now;
             }
             std::this_thread::sleep_for(backoff);
@@ -542,7 +593,7 @@ bool Storage::insert_rows(const std::vector<const PersistJob *> &rows)
 
         if (++failures >= 3)
         {
-            logging::error() << "[DB] 批量写入失败: "
+            logging::error() << label << " 批量写入失败: "
                              << (error.empty() ? "未知 SQLite 错误" : error);
             return false;
         }
@@ -550,7 +601,7 @@ bool Storage::insert_rows(const std::vector<const PersistJob *> &rows)
     }
 }
 
-int Storage::try_insert(const std::vector<const PersistJob *> &rows, std::string &error)
+int Storage::try_insert(const std::vector<PersistJob *> &rows, std::string &error)
 {
     int result = writer_->execute("BEGIN IMMEDIATE;", error);
     if (result != SQLITE_OK)
@@ -615,6 +666,13 @@ void Storage::checkpoint(bool final_checkpoint)
         }
     }
     wal_bytes_.store(wal_size());
+
+    if (file_index_)
+    {
+        const file_index::Result result = file_index_->checkpoint(final_checkpoint);
+        if (!result && final_checkpoint)
+            logging::error() << "[FileIndex] 检查点失败: " << result.message;
+    }
 }
 
 // Measured through an open handle: on Windows the size in the directory

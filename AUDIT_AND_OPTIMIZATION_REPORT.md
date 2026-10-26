@@ -11,7 +11,7 @@ SQLite 3.54.1), Python 3.15.1 (test harness only).
 |---|---|---|
 | Windows build | fails: `arpa/inet.h` (simple_network.cpp, tracker_server.cpp) and `create_torrent(torrent_info)` removed in libtorrent 2.1 (dht_db.cpp) | all targets build, **0 warnings** with `-Wall -Wextra -Wpedantic -Werror`, Release and Debug |
 | Windows binaries | — | self-contained (only system DLLs: KERNEL32, WS2_32, MSWSOCK, IPHLPAPI, bcrypt, CRYPT32, ADVAPI32, USER32, SHELL32, msvcrt) |
-| Tests | none | 26 C++ unit/stress tests + 28 Python integration/stress tests, **100 % passing** (Release and Debug, libtorrent asserts on) |
+| Tests | none | 33 C++ unit/stress tests + 29 Python integration/stress tests, **100 % passing** (Release; Debug with libtorrent asserts as of §10) |
 | Address families per process | one (`--bind` takes a single address) | IPv4 + IPv6 dual-stack in one process (`--bind 0.0.0.0,::`), see §10 |
 | Metadata concurrency per session | effectively **3** (libtorrent auto-manager) regardless of `--max-active` | `--max-active` (default 200); verified 5/5 concurrent in a test that yields 3/5 on the old code |
 | Cross-session duplicate fetches | possible (per-session state) | impossible (process-wide claim table) |
@@ -88,7 +88,8 @@ UDP announce_peer ─►│ dht_pkt_alert → bdecode (reused node, depth 10 / 5
                           │ lookups                                   │ jobs (≤4096, ≤256 MiB)
                           ▼                                           ▼
              storage reader thread (own conn,              storage writer thread (own conn)
-             short read txns, never pins WAL)              atomic .torrent publish → batched
+             short read txns, never pins WAL)              [--save-torrents: atomic .torrent
+                                                           publish] → batched
                                                            INSERT OR IGNORE, BUSY-retry,
                                                            checkpoint/TRUNCATE
                                                            └─► HashRegistry::settle_*
@@ -208,15 +209,20 @@ Areas: **(1)** libtorrent multi-session mechanics, **(2)** concurrency/backpress
 ## 5. Intentional behaviour changes
 
 All CLI options and positional arguments keep their meaning; new ones are `--max-active-total`,
-`--dedup-cache-size`, `--dht-save-interval`, `--bootstrap-stagger-ms`. `--bind` (and the
+`--dedup-cache-size`, `--dht-save-interval`, `--bootstrap-stagger-ms`, `--save-torrents`,
+`--file-index`, `--disable-file-index` (§12). `--bind` (and the
 positional `bind_addr`) additionally accept a comma-separated list and `--bind` may be repeated
 (§10); a single address behaves exactly as before.
 
 - SQLite: schema, column types and value formats unchanged (`info_hash` lowercase hex,
   `discovered_peer` `a.b.c.d:port` / `[v6]:port`, `CURRENT_TIMESTAMP` UTC). `synchronous=NORMAL`
   (WAL-safe; the last commits before a power loss may be rolled back).
-- `.torrent` files contain the verified `info` dictionary verbatim (same info-hash); optional
-  top-level keys produced by the old `create_torrent::generate()` may differ.
+- `.torrent` files are **no longer written by default**; `--save-torrents` turns it on
+  (into `--torrent-dir`, default `torrents`). Without it the crawler neither serialises the
+  torrent (`write_torrent_file_buf` is not called) nor creates the directory; the database row,
+  deduplication and retry behaviour are unchanged. When enabled, files contain the verified
+  `info` dictionary verbatim (same info-hash); optional top-level keys produced by the old
+  `create_torrent::generate()` may differ.
 - Torrents are added unpaused and not auto-managed (H1); `metadata_failed_alert` fails a task
   immediately.
 - An announce dropped because of saturation no longer blacklists the hash for `retry_delay`.
@@ -374,3 +380,137 @@ reply batch (O2).
 
 Verified by `CrawlerBindArgumentTests` (2 tests) and `DualStackCrawlerTests` (5 tests) in §7.
 A manual run showed `节点 ID 2` saved and restored per session with `--bind 127.0.0.1,[::1]`.
+
+## 11. DHT ingest CPU under heavy traffic (follow-up)
+
+Two community suggestions were checked against the libtorrent 2.1.2 source and measured.
+
+**Claim 1 — `dht_log` string formatting.** Confirmed mechanism. `dht_pkt_alert` exists only in
+`alert_category::dht_log`, and that category also gates `dht_log_alert`: libtorrent's DHT logger
+`should_log()` is just `should_post<dht_log_alert>()`, and every `log()` call `vsnprintf`s an
+alert (session_impl.cpp:7262-7276; ~110 log sites in `src/kademlia/`). `log_packet` copies every
+incoming **and** outgoing DHT packet into a `dht_pkt_alert` (session_impl.cpp:7279-7288). The two
+cannot be separated through the alert mask.
+
+**Claim 2 — `bdecode` of every packet.** Confirmed: the crawler decoded every incoming packet a
+second time (libtorrent already decodes each one), partly just to count requests/responses.
+
+**Why a session plugin is not the answer.** libtorrent's `plugin::on_dht_request` hands plugins
+each request already decoded, without any alerts, and runs before the announce token check
+(node.cpp:833 vs 940). But libtorrent drops queries *before* that hook once the DHT upload quota
+(`dht_upload_rate_limit`, default 8000 B/s with 3 s burst; dht_tracker.cpp:630) is spent
+(node.cpp:307-311), whereas `dht_pkt_alert` is posted earlier, for every packet. Under heavy
+traffic the packet sniffer therefore harvests announces from queries libtorrent itself
+discards; a plugin would miss them, or would need an unlimited quota, which makes libtorrent
+answer every query and costs more CPU (and upload bandwidth) than everything saved.
+
+**Benchmark** (`tests/dht_ingest_bench.cpp`, `tests/dht_ingest_bench.py`, opt-in target
+`-DDHT_CRAWLER_BUILD_BENCHMARKS=ON`): a libtorrent session on loopback receives a KRPC mix
+(25 % announce_peer, 40 % get_peers, 20 % find_node, 15 % ping) from 254 source addresses at
+10 000 messages/s for 10 s, with libtorrent's per-IP rate limit lifted. CPU is counted exactly
+(`QueryProcessCycleTime` / `CLOCK_PROCESS_CPUTIME_ID`) because tick-based `GetProcessTimes`
+produced contradictory numbers and was discarded. Windows 11 loopback; absolute numbers will
+differ on Linux, the comparison is what matters.
+
+Default quota (production setting), modes interleaved, median of 7 runs:
+
+| mode | kcycles/message (min..max) | announces seen | dht_log alerts | dht_pkt alerts |
+|---|---|---|---|---|
+| sniff (previous crawler) | 98.4 (80.3..104.6) | 24 140 | 1 240 | 100 903 |
+| prefilter (crawler now) | 92.1 (89.1..99.7) | 24 140 | 1 241 | 100 911 |
+| alerts only, no parsing | 90.6 (82.7..96.9) | — | 1 239 | 100 901 |
+| plugin, no `dht_log` | 76.9 (68.1..88.6) | **234** | 0 | 0 |
+| no capture at all | 80.0 (69.2..87.7) | — | 0 | 0 |
+
+libtorrent dropped 98.9 % of the queries at this rate (`dht_messages_in_dropped`), so it logged
+little: ~1 `dht_log_alert` per 80 messages, but one packet copy per message.
+
+Unlimited quota (`--upload-limit 100000000`, libtorrent answers everything), median of 3 runs:
+
+| mode | kcycles/message | announces seen | dht_log alerts | dht_pkt alerts |
+|---|---|---|---|---|
+| sniff | 142.9 | 24 133 | 123 650 | 199 799 |
+| prefilter | 132.3 | 24 141 | 123 680 | 199 843 |
+| alerts only | 133.3 | — | 123 641 | 199 785 |
+| plugin | 130.4 | 24 144 | 0 | 0 |
+| no capture | 126.6 | — | 0 | 0 |
+
+Here libtorrent formats ~1.24 log alerts and copies 2 packets per message.
+
+**Reading:** both overheads are real but modest. Alert generation costs ~5-13 % of ingest
+CPU and our second `bdecode` ~7-8 %. The dominant cost is libtorrent's own DHT handling, and it
+grows ~50 % once libtorrent answers every query. Run-to-run spread is ±15 %, so differences of a
+few percent are within noise.
+
+**Changes made (dht_db.cpp):**
+- `handle_dht_packet` skips any packet that does not contain `13:announce_peer` (the bencoded
+  query name every announce_peer must carry) before decoding; the full `y`/`q` checks still run
+  on the rest. No false negatives: the benchmark saw identical announce counts.
+- Req/Resp in the per-session stats line now come from libtorrent's session counters
+  (`post_session_stats()`, posted regardless of the alert mask): Req = requests libtorrent
+  handled (sum of the disjoint `dht_*_in` / `dht_invalid_*` counters), new Dropped =
+  `dht_messages_in_dropped`, Resp = the remainder. The old Req (all queries seen) ≈ new
+  Req + Dropped.
+- `alert_category::dht_log` stays enabled: it is the only way to see quota-dropped announces.
+
+**Not verified here:** Windows Smart App Control switched to enforcement during this work and
+blocks newly built unsigned executables (Code Integrity events 3033/3077). The new `dht_db.exe`
+and benchmark compile warning-free, but neither could be executed, so the integration tests did
+not run against this change. The measurements above come from a benchmark built before the
+block, whose `prefilter` mode implements the same check. Run `ctest` (and optionally the
+benchmark) on the Linux host to confirm.
+
+**Further lead (not measured):** every metadata task's torrent also does its own DHT lookup and
+announces the crawler as a peer (libtorrent default for magnet torrents), which produces the
+crawler's own RPC traffic, logging and packet alerts. Profiling production (`perf top`) or
+trialling `torrent_flags::disable_dht` would show whether that matters; it trades away extra
+metadata sources.
+
+## 12. File-list index (follow-up feature)
+
+On by default (`--disable-file-index` turns it off, `--file-index PATH` moves it from
+`dht_files.db`): every fetched torrent's directory structure, file names and sizes go into a
+standalone SQLite database next to, not inside, the crawler database (whose schema is unchanged).
+
+**Format.** Table `file_lists(info_hash BLOB PRIMARY KEY, name, file_count, total_size, files)`
+declared `WITHOUT ROWID`, so the table is itself a B-tree clustered on the 20-byte hash and a
+lookup is one descent. SQLite was chosen because it is already a dependency, is B-tree based,
+gives crash-safe writes and lets other processes read while the crawler writes (WAL). Each file
+list is one front-coded varint blob (paths sharing a directory prefix store only the
+difference), so a torrent costs one row rather than one row per file. `index_meta` records
+format version 1. The full byte-level spec is at the top of `file_index.hpp`.
+
+**API (`file_index.hpp`, CMake target `file_index`, SQLite only, no libtorrent).**
+`FileIndex(path, Mode)` with `get / contains / size / put / checkpoint`, plus
+`encode_files / decode_files`, `render_tree`, `format_size`, `printable`, `parse_hash`,
+`to_hex`. The decoder validates every length against the remaining input, so a corrupt row
+raises instead of reading out of bounds. Tree rendering is iterative and caps nesting at 32
+levels, deeper remainders shown on one line, so hostile metadata can neither overflow the
+stack nor blow output up quadratically. `printable()` escapes control characters, invalid
+UTF-8 and bidi overrides (a "txt‮exe" trick) while keeping valid UTF-8.
+
+**Extraction (`torrent_file_list.cpp`).** Parsed from the verified raw info dictionary with
+libtorrent's bounded `bdecode`, not from libtorrent's `file_storage`, which sanitises names per
+platform (Windows rewrites `:` and uses `\`); names therefore match the torrent exactly and are
+identical on both platforms. `name.utf-8`/`path.utf-8` are preferred as libtorrent does; BEP 47
+padding files (attr `p`, legacy `_____padding_file`) are skipped; `/` inside a component
+becomes `_`. The v1 file list is used: the crawler looks torrents up by v1 info-hash, so it only
+ever fetches v1 or hybrid torrents, both of which carry it.
+
+**Write path.** The storage writer thread commits a batch's file lists **before** its crawler
+rows, with the same BUSY retry / shutdown drain logic (`commit_with_retry`). If the index write
+fails the batch is failed and refetched later, so with the index on every crawler row has its
+file list. Index WAL is checkpointed with the crawler database and truncated at shutdown. Queue
+memory accounting includes the file lists.
+
+**Lookup tool `dht_files`.** `dht_files [--index PATH] [--ascii] [--bytes] HASH...` opens the
+index read-only (safe while the crawler runs) and prints the tree; exit 0 all found, 1 some
+invalid/not found, 2 usage or index error.
+
+**Tests.** Unit: exact encoded bytes, round trip incl. 2^64-1 sizes, every truncation and
+malformed form rejected, put/get/replace/read-only/foreign-database, exact Unicode and ASCII
+tree output, 20 000-level nesting bounded, size formatting, hostile-name escaping, storage
+writing file lists with rows. Integration (`test_4b`): a real libtorrent session fetches a
+multi-file torrent with a padding file from the fake peer; `dht_files` output is compared byte
+for byte, and the unknown-hash exit code is checked. Full suite green on Windows Release;
+Debug and Linux were not run for this change.

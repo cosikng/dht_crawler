@@ -2,6 +2,7 @@
 // Run: unit_tests [name-filter]
 
 #include "crawler_storage.hpp"
+#include "file_index.hpp"
 #include "hash_registry.hpp"
 #include "logger.hpp"
 #include "platform.hpp"
@@ -20,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <set>
@@ -828,6 +830,228 @@ TEST(storage_queues_are_bounded)
     sqlite3_close(blocker);
     CHECK(collector.wait([&](Collector &c) { return c.persisted == static_cast<std::size_t>(accepted); }, 30s));
     CHECK(!store.under_pressure());
+}
+
+TEST(storage_writes_file_lists_with_rows)
+{
+    TempDir directory("file_lists");
+    storage::Options options;
+    options.database_path = directory.path() / "crawler.db";
+    options.file_index_path = directory.path() / "files.db";
+    Collector collector;
+    {
+        storage::Storage store(options, collector.lookup_handler(), collector.persist_handler());
+        for (std::uint64_t i = 0; i < 100; ++i)
+        {
+            storage::PersistJob job = make_job(i + 120000);
+            file_index::Entry entry;
+            entry.info_hash = job.hash;
+            entry.name = job.name;
+            entry.files = {{job.name + "/a.bin", i}, {job.name + "/sub/b.bin", 2 * i}};
+            job.file_list = std::move(entry);
+            submit_with_backpressure(store, std::move(job));
+        }
+        CHECK(collector.wait([](Collector &c) { return c.persisted == 100; }));
+    }
+
+    file_index::FileIndex index(options.file_index_path);
+    CHECK_EQ(index.size(), std::uint64_t{100});
+    const auto entry = index.get(make_hash(120007));
+    CHECK(entry.has_value());
+    CHECK_EQ(entry->files.size(), std::size_t{2});
+    CHECK_EQ(entry->files[1].size, std::uint64_t{14});
+    CHECK_EQ(entry->total_size(), std::uint64_t{21});
+    CHECK(!std::filesystem::exists(directory.path() / (storage::to_hex(make_hash(120007)) + ".torrent")));
+}
+
+// ---------------------------------------------------------------------------
+// File index API
+
+file_index::Entry sample_entry()
+{
+    file_index::Entry entry;
+    for (std::size_t i = 0; i < entry.info_hash.size(); ++i)
+        entry.info_hash[i] = static_cast<std::uint8_t>(i);
+    entry.name = "\xe5\x90\x88\xe9\x9b\x86";  // 合集
+    entry.files = {
+        {entry.name + "/docs/\xe8\xaf\xb4\xe6\x98\x8e.txt", 1500},  // 说明.txt
+        {entry.name + "/video/part 1.mkv", 2500000},
+        {entry.name + "/video/sub/a.srt", 10},
+    };
+    return entry;
+}
+
+bool same_files(const std::vector<file_index::File> &left, const std::vector<file_index::File> &right)
+{
+    if (left.size() != right.size())
+        return false;
+    for (std::size_t i = 0; i < left.size(); ++i)
+    {
+        if (left[i].path != right[i].path || left[i].size != right[i].size)
+            return false;
+    }
+    return true;
+}
+
+TEST(file_index_encoding_is_front_coded_and_round_trips)
+{
+    // count 2 | shared 0, len 2, "ab", size 1 | shared 1, len 1, "c", size 300
+    const std::string expected("\x02\x00\x02" "ab" "\x01\x01\x01" "c" "\xac\x02", 11);
+    CHECK(file_index::encode_files({{"ab", 1}, {"ac", 300}}) == expected);
+
+    const std::vector<file_index::File> files = {
+        {"Album/cd1/01.flac", 10},
+        {"Album/cd1/02.flac", std::uint64_t{1} << 40},
+        {"Album/cover.jpg", 0},
+        {"Other", std::numeric_limits<std::uint64_t>::max()},
+        {"", 7},
+    };
+    const auto decoded = file_index::decode_files(file_index::encode_files(files));
+    CHECK(decoded && same_files(*decoded, files));
+    const auto empty = file_index::decode_files(file_index::encode_files({}));
+    CHECK(empty && empty->empty());
+}
+
+TEST(file_index_decoder_rejects_malformed_input)
+{
+    const std::string valid = file_index::encode_files(sample_entry().files);
+    for (std::size_t size = 0; size < valid.size(); ++size)
+        CHECK(!file_index::decode_files(std::string_view(valid.data(), size)));
+    CHECK(!file_index::decode_files(valid + '\0'));
+    CHECK(!file_index::decode_files(std::string("\x01\x05\x00\x00", 4)));            // shared > previous
+    CHECK(!file_index::decode_files(std::string("\xff\xff\xff\xff\x0f", 5)));        // absurd count
+    CHECK(!file_index::decode_files(std::string(11, '\xff')));                       // varint overflow
+    CHECK(!file_index::decode_files(std::string("\x01\x00\x7f" "ab\x01", 6)));       // suffix too long
+}
+
+TEST(file_index_store_put_get_replace_and_read_only)
+{
+    TempDir directory("file_index");
+    const fs::path path = directory.path() / platform::path_from_utf8("\xe7\xb4\xa2\xe5\xbc\x95.db");  // 索引.db
+    file_index::Entry first = sample_entry();
+    file_index::Entry second = sample_entry();
+    second.info_hash[0] = 0xff;
+    second.name = "single.bin";
+    second.files = {{"single.bin", 42}};
+
+    file_index::FileIndex writer(path, file_index::FileIndex::Mode::read_write);
+    CHECK(writer.put({first, second}));
+    CHECK_EQ(writer.size(), std::uint64_t{2});
+
+    file_index::FileIndex reader(path);
+    const auto found = reader.get(first.info_hash);
+    CHECK(found && found->name == first.name && same_files(found->files, first.files));
+    CHECK(reader.contains(second.info_hash));
+    file_index::InfoHash missing{};
+    missing.fill(0xee);
+    CHECK(!reader.get(missing));
+    CHECK(!reader.contains(missing));
+    CHECK(reader.put({first}).status == file_index::Status::error);
+
+    second.files = {{"single.bin", 43}};
+    CHECK(writer.put({second}));
+    CHECK_EQ(reader.get(second.info_hash)->files.front().size, std::uint64_t{43});
+    CHECK_EQ(reader.size(), std::uint64_t{2});
+    CHECK(writer.checkpoint(true));
+
+    bool threw = false;
+    try
+    {
+        file_index::FileIndex absent(directory.path() / "absent.db");
+    }
+    catch (const std::runtime_error &)
+    {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // Another SQLite file (the crawler database, say) is not an index.
+    {
+        storage::Options options;
+        options.database_path = directory.path() / "crawler.db";
+        Collector collector;
+        storage::Storage store(options, collector.lookup_handler(), collector.persist_handler());
+    }
+    threw = false;
+    try
+    {
+        file_index::FileIndex wrong(directory.path() / "crawler.db");
+    }
+    catch (const std::runtime_error &)
+    {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(file_index_renders_a_tree)
+{
+    const std::string unicode = file_index::render_tree(sample_entry());
+    CHECK_EQ(unicode, std::string(
+        "000102030405060708090a0b0c0d0e0f10111213  \xe5\x90\x88\xe9\x9b\x86\n"
+        "3 files, 2.4 MiB\n"
+        "\xe5\x90\x88\xe9\x9b\x86/  [2.4 MiB]\n"
+        "\xe2\x94\x9c\xe2\x94\x80\xe2\x94\x80 docs/  [1.5 KiB]\n"
+        "\xe2\x94\x82   \xe2\x94\x94\xe2\x94\x80\xe2\x94\x80 \xe8\xaf\xb4\xe6\x98\x8e.txt  [1.5 KiB]\n"
+        "\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80 video/  [2.4 MiB]\n"
+        "    \xe2\x94\x9c\xe2\x94\x80\xe2\x94\x80 part 1.mkv  [2.4 MiB]\n"
+        "    \xe2\x94\x94\xe2\x94\x80\xe2\x94\x80 sub/  [10 B]\n"
+        "        \xe2\x94\x94\xe2\x94\x80\xe2\x94\x80 a.srt  [10 B]\n"));
+
+    file_index::TreeOptions ascii;
+    ascii.ascii = true;
+    ascii.exact_sizes = true;
+    CHECK_EQ(file_index::render_tree(sample_entry(), ascii), std::string(
+        "000102030405060708090a0b0c0d0e0f10111213  \xe5\x90\x88\xe9\x9b\x86\n"
+        "3 files, 2501510 B\n"
+        "\xe5\x90\x88\xe9\x9b\x86/  [2501510 B]\n"
+        "|-- docs/  [1500 B]\n"
+        "|   `-- \xe8\xaf\xb4\xe6\x98\x8e.txt  [1500 B]\n"
+        "`-- video/  [2500010 B]\n"
+        "    |-- part 1.mkv  [2500000 B]\n"
+        "    `-- sub/  [10 B]\n"
+        "        `-- a.srt  [10 B]\n"));
+
+    file_index::Entry single;
+    single.name = "x.bin";
+    single.files = {{"x.bin", 5}};
+    CHECK_EQ(file_index::render_tree(single), std::string(
+        "0000000000000000000000000000000000000000  x.bin\n1 file, 5 B\nx.bin  [5 B]\n"));
+}
+
+TEST(file_index_tree_depth_is_bounded)
+{
+    file_index::Entry deep;
+    std::string path = "root";
+    for (int i = 0; i < 20000; ++i)
+        path += "/d";
+    deep.name = "root";
+    deep.files = {{path, 1}};
+    const std::string tree = file_index::render_tree(deep);
+    CHECK(std::count(tree.begin(), tree.end(), '\n') <= 2 + 32);
+    CHECK(tree.size() < 200000);
+}
+
+TEST(file_index_formats_sizes_hashes_and_hostile_names)
+{
+    CHECK_EQ(file_index::format_size(0), std::string("0 B"));
+    CHECK_EQ(file_index::format_size(1023), std::string("1023 B"));
+    CHECK_EQ(file_index::format_size(1024), std::string("1.0 KiB"));
+    CHECK_EQ(file_index::format_size(1536), std::string("1.5 KiB"));
+    CHECK_EQ(file_index::format_size(1048575), std::string("1.0 MiB"));
+    CHECK_EQ(file_index::format_size(std::uint64_t{5} << 30), std::string("5.0 GiB"));
+
+    const auto hash = file_index::parse_hash("000102030405060708090A0B0C0D0E0F10111213");
+    CHECK(hash && file_index::to_hex(*hash) == "000102030405060708090a0b0c0d0e0f10111213");
+    CHECK(!file_index::parse_hash("0001"));
+    CHECK(!file_index::parse_hash(std::string(40, 'g')));
+
+    CHECK_EQ(file_index::printable("\xe4\xb8\xad\xe6\x96\x87 ok"), std::string("\xe4\xb8\xad\xe6\x96\x87 ok"));
+    CHECK_EQ(file_index::printable("a\nb\x1b[2J"), std::string("a\\x0ab\\x1b[2J"));
+    CHECK_EQ(file_index::printable("\xff"), std::string("\\xff"));
+    CHECK_EQ(file_index::printable("\xc0\xaf"), std::string("\\xc0\\xaf"));                  // overlong
+    CHECK_EQ(file_index::printable("\xed\xa0\x80"), std::string("\\xed\\xa0\\x80"));         // surrogate
+    CHECK_EQ(file_index::printable("txt\xe2\x80\xae" "exe"), std::string("txt\\u{202E}exe")); // bidi override
 }
 
 } // namespace

@@ -61,6 +61,17 @@ ctest --test-dir build --output-on-failure
 优雅退出，以及通过模拟 DHT 节点和 BitTorrent peer 完成的端到端元数据抓取。
 测试只使用本机回环地址，不访问公网。
 
+用 `-DDHT_CRAWLER_BUILD_BENCHMARKS=ON` 还可以编译 `dht_ingest_bench`，比较不同
+announce 捕获方式处理 DHT 流量的 CPU 开销（同样只走回环地址）：
+
+```shell
+python3 tests/dht_ingest_bench.py --bench build/dht_ingest_bench --rate 10000 --runs 5
+```
+
+每个 session 每 60 秒输出一行统计：`Req` 为 libtorrent 处理的 DHT 请求数，
+`Dropped` 为 libtorrent 丢弃的消息数（主要是超出 `dht_upload_rate_limit` 上行配额
+的请求；其中的 announce_peer 仍会被捕获），`Resp` 为其余消息（回复和错误）。
+
 ### DHT 爬虫
 
 兼容原有位置参数：
@@ -84,6 +95,10 @@ ctest --test-dir build --output-on-failure
 使用 `./build/dht_db --help` 查看数据库路径、临时目录、torrent
 目录、DHT 状态目录和 bootstrap 节点等选项。新增选项：
 
+- `--save-torrents`：把获取到的元数据另存为完整 `.torrent` 文件（写入 `--torrent-dir`，
+  默认 `torrents`）。默认不保存，只写数据库记录。
+- `--file-index PATH` / `--disable-file-index`：文件列表索引的路径（默认 `dht_files.db`）
+  和关闭开关，默认开启，详见“文件列表索引”。
 - `--max-active-total N`：全进程并发元数据任务上限，默认 `listeners * max-active`。
 - `--dedup-cache-size N`：内存去重缓存的最大条目数，默认 262144，超过后淘汰最旧条目。
 - `--dht-save-interval SEC`：定期保存 DHT 状态的间隔，默认 900 秒。
@@ -190,9 +205,72 @@ RPC 绑定失败时，`dht_db` 会记录错误并继续原有爬虫功能。无�
 
 ### 结果查看
 
-默认会生成 `tmp`、`torrents` 目录和 `dht_crawler.db` 数据库（WAL 模式）。
-数据库记录种子 Hash、资源名、提供元数据的 peer 和发现时间；
-`torrents` 目录按 Hash 保存 `.torrent` 文件。表结构与之前版本完全相同。
+默认会生成 `tmp`、`dht_state` 目录、`dht_crawler.db` 数据库（WAL 模式）和
+`dht_files.db` 文件列表索引（见下文）。
+数据库记录种子 Hash、资源名、提供元数据的 peer 和发现时间，表结构与之前版本完全相同。
+
+默认不保存 `.torrent` 文件。使用 `--save-torrents` 启动时才会创建 `torrents`
+目录（或 `--torrent-dir` 指定的目录），并按 Hash 保存 `<info_hash>.torrent`。
+是否保存不影响去重：已入库的 Hash 不会被重复抓取；之前保存的文件不会被删除。
+
+### 文件列表索引
+
+默认开启：每获取到一个种子的元数据，就把其中记录的目录结构、文件名和文件大小
+写入独立的索引文件 `dht_files.db`（与 `dht_crawler.db` 分开）。
+
+- `--file-index PATH`：索引文件路径，默认 `dht_files.db`。
+- `--disable-file-index`：不记录文件列表。
+
+同一批次中文件列表先于爬虫数据库记录提交，因此开启时数据库中每条记录都有对应的
+文件列表；写入失败的种子不会入库，之后会被重新抓取。文件名按种子中的记录原样保存
+（优先使用 `name.utf-8`/`path.utf-8`，两个平台结果完全相同），BEP 47 填充文件
+不计入。
+
+用 `dht_files` 按 Hash 查询，输出目录树（爬虫运行时也可以查询）：
+
+```shell
+./build/dht_files --index dht_files.db 0123456789abcdef0123456789abcdef01234567
+```
+
+```text
+0123456789abcdef0123456789abcdef01234567  合集
+3 files, 2.4 MiB
+合集/  [2.4 MiB]
+├── docs/  [1.5 KiB]
+│   └── 说明.txt  [1.5 KiB]
+└── video/  [2.4 MiB]
+    ├── part 1.mkv  [2.4 MiB]
+    └── sub/  [10 B]
+        └── a.srt  [10 B]
+```
+
+`--ascii` 改用 ASCII 字符绘制，`--bytes` 显示精确字节数；可一次查询多个 Hash。
+退出码：0 全部找到，1 有 Hash 无效或未找到，2 参数错误或无法读取索引。名称中的
+控制字符、非法 UTF-8 和双向控制字符会被转义显示。
+
+**格式与 API。** 索引是 SQLite 数据库（WAL 模式），表 `file_lists` 以 20 字节
+info-hash 为主键并使用 `WITHOUT ROWID`，即表本身就是按 Hash 聚簇的 B 树，按 Hash
+查询只需一次 B 树查找；每个种子的文件列表编码为一个紧凑的 BLOB（varint + 路径前缀
+压缩）。完整格式说明见 [file_index.hpp](file_index.hpp)。下游程序链接 CMake 目标
+`file_index`（只依赖 SQLite，不依赖 libtorrent）即可读写：
+
+```cpp
+#include "file_index.hpp"
+
+file_index::FileIndex index("dht_files.db");                  // 只读
+if (auto hash = file_index::parse_hash("0123456789abcdef0123456789abcdef01234567"))
+{
+    if (std::optional<file_index::Entry> entry = index.get(*hash))
+    {
+        for (const file_index::File &file : entry->files)
+            use(file.path, file.size);                         // "合集/docs/说明.txt", 1500
+        std::string tree = file_index::render_tree(*entry);
+    }
+}
+```
+
+`FileIndex` 还提供 `contains()`、`size()`、`put()`（`Mode::read_write`）和
+`checkpoint()`；每个线程使用自己的 `FileIndex` 对象。
 
 ### 免责声明
 

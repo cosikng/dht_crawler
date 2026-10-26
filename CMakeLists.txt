@@ -13,6 +13,7 @@ project(dht_crawler LANGUAGES CXX)
 
 option(DHT_CRAWLER_BUILD_TESTS "Build the unit and integration tests" ON)
 option(DHT_CRAWLER_WERROR "Treat compiler warnings as errors" OFF)
+option(DHT_CRAWLER_BUILD_BENCHMARKS "Build the DHT ingest benchmark" OFF)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -69,19 +70,27 @@ endif()
 add_library(tracker_protocol STATIC tracker_protocol.cpp)
 target_link_libraries(tracker_protocol PUBLIC crawler_platform)
 
+# File index API (file_index.hpp): standalone, libtorrent-free, for the
+# crawler, the dht_files tool and downstream applications.
+add_library(file_index STATIC file_index.cpp)
+target_link_libraries(file_index PUBLIC crawler_platform ${SQLITE_TARGET})
+
 add_library(crawler_core STATIC
     hash_registry.cpp
     crawler_storage.cpp
 )
-target_link_libraries(crawler_core PUBLIC crawler_platform ${SQLITE_TARGET})
+target_link_libraries(crawler_core PUBLIC crawler_platform file_index ${SQLITE_TARGET})
 
-add_executable(dht_db dht_db.cpp)
+add_executable(dht_db dht_db.cpp torrent_file_list.cpp)
 target_link_libraries(dht_db PRIVATE crawler_core ${LIBTORRENT_TARGET})
+
+add_executable(dht_files dht_files.cpp)
+target_link_libraries(dht_files PRIVATE file_index)
 
 add_executable(tracker_server tracker_server.cpp)
 target_link_libraries(tracker_server PRIVATE tracker_protocol)
 
-set(DHT_CRAWLER_TARGETS crawler_platform tracker_protocol crawler_core dht_db tracker_server)
+set(DHT_CRAWLER_TARGETS crawler_platform tracker_protocol file_index crawler_core dht_db dht_files tracker_server)
 
 if(DHT_CRAWLER_BUILD_TESTS)
     enable_testing()
@@ -101,11 +110,19 @@ if(DHT_CRAWLER_BUILD_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration_test.py"
                 --tracker "$<TARGET_FILE:tracker_server>"
                 --crawler "$<TARGET_FILE:dht_db>"
+                --files-tool "$<TARGET_FILE:dht_files>"
         )
         set_tests_properties(integration_tests PROPERTIES TIMEOUT 900)
     else()
         message(STATUS "Python 3 not found: integration_tests will not be registered")
     endif()
+endif()
+
+# CPU cost of DHT ingest per announce-capture strategy; run tests/dht_ingest_bench.py.
+if(DHT_CRAWLER_BUILD_BENCHMARKS)
+    add_executable(dht_ingest_bench tests/dht_ingest_bench.cpp)
+    target_link_libraries(dht_ingest_bench PRIVATE ${LIBTORRENT_TARGET} Threads::Threads)
+    list(APPEND DHT_CRAWLER_TARGETS dht_ingest_bench)
 endif()
 
 foreach(target IN LISTS DHT_CRAWLER_TARGETS)

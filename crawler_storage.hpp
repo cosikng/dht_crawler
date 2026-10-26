@@ -1,5 +1,7 @@
 #pragma once
 
+#include "file_index.hpp"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -11,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,7 +24,8 @@ struct sqlite3_stmt;
 // SQLite persistence for the crawler. All database work happens on two
 // threads that each own a private connection and prepared statements: a
 // reader that answers "is this info-hash already stored?" and a writer that
-// publishes .torrent files and inserts rows in batched transactions. Callers
+// optionally publishes .torrent files and inserts rows in batched
+// transactions. Callers
 // only enqueue (never block), both queues are bounded, and results come back
 // through callbacks on the storage threads.
 //
@@ -51,13 +55,21 @@ struct PersistJob
     std::string hash_hex;
     std::string name;
     std::string peer;
+    // Bencoded .torrent; only used when Options::torrent_dir is set.
     std::vector<char> torrent_file;
+    // Stored in the file index when Options::file_index_path is set.
+    std::optional<file_index::Entry> file_list;
 };
 
 struct Options
 {
     std::filesystem::path database_path;
+    // Where <info_hash>.torrent files are written; empty: not written.
     std::filesystem::path torrent_dir;
+    // File index database (see file_index.hpp); empty: disabled. Each
+    // batch's file lists are committed before its crawler rows, so a hash
+    // with a crawler row always has its file list.
+    std::filesystem::path file_index_path;
     std::size_t max_lookups = 65536;
     std::size_t max_persist_jobs = 4096;
     std::size_t max_persist_bytes = std::size_t{256} << 20;
@@ -133,8 +145,12 @@ private:
     void writer_loop();
     void process_batch(std::vector<PersistJob> &batch);
     void report(const PersistJob &job, bool persisted) noexcept;
-    bool insert_rows(const std::vector<const PersistJob *> &rows);
-    int try_insert(const std::vector<const PersistJob *> &rows, std::string &error);
+    bool write_file_lists(const std::vector<PersistJob *> &rows);
+    // Runs `attempt` (returning an SQLite result code) until it succeeds,
+    // retrying a locked database and up to 3 other failures.
+    bool commit_with_retry(const char *label, const std::function<int(std::string &)> &attempt);
+    int try_insert(const std::vector<PersistJob *> &rows, std::string &error);
+    static std::size_t job_bytes(const PersistJob &job);
     void checkpoint(bool final_checkpoint);
     std::uint64_t wal_size() const;
 
@@ -143,6 +159,7 @@ private:
     PersistHandler on_persist_;
 
     std::unique_ptr<Connection> writer_;
+    std::unique_ptr<file_index::FileIndex> file_index_;
     std::unique_ptr<Connection> reader_;
     std::unique_ptr<Statement> insert_statement_;
     std::unique_ptr<Statement> contains_statement_;
